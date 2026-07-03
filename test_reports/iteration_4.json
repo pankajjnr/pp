@@ -1,0 +1,31 @@
+{
+  "summary": "Iteration 4 frontend-only sweep. Dashboard.jsx compile-blocker from iteration_3 is fully resolved — /login and / render cleanly with no CRA overlay. Unauthenticated /login has ZERO 401s and ZERO console errors. Login with admin@ledger.app / admin123 succeeds and lands on Daily Log. Radix DialogDescription sweep passes for Add Payment, Calc Confirm, Add Client, and per-client Calculate dialogs. ONE remaining Radix warning: the Calc RESULT dialog (post-confirm on Dashboard Calculate Now) still emits 'Missing Description or aria-describedby={undefined} for DialogContent' twice. Client search 'ravi' correctly matches Shree Ravi Kumar Ji. No console errors across the authenticated session.",
+  "tested_scope": ["frontend", "auth", "integration"],
+  "passed": [
+    "No CRA 'Compiled with problems' overlay on /login or /",
+    "Unauthenticated /login: 0 401s, 0 console errors, 0 Radix warnings",
+    "Login (admin@ledger.app/admin123) succeeds → lands on Dashboard (/)",
+    "Add Payment dialog opens without Radix warnings",
+    "Calculate Now confirm dialog opens without Radix warnings",
+    "Add Client dialog on /clients opens without Radix warnings",
+    "Per-client Calculate dialog on client detail opens without Radix warnings",
+    "Client search 'ravi' matches 'Shree Ravi Kumar Ji'",
+    "Client detail page renders (Shree Ravi Kumar Ji, net balance -₹14,445)"
+  ],
+  "failed": [
+    {
+      "area": "Dashboard.jsx — Calculate Now RESULT dialog",
+      "issue": "Radix DialogContent missing Description/aria-describedby (warning fires twice when the 2-line result modal opens after confirming Calculate Now)",
+      "evidence": "Console: 'Warning: Missing `Description` or `aria-describedby={undefined}` for {DialogContent}.' (x2) captured immediately after clicking the confirm button in the Tally/Calc confirm dialog on the Dashboard.",
+      "priority": "MEDIUM"
+    }
+  ],
+  "action_items": [
+    "Add <DialogDescription className=\"sr-only\">…</DialogDescription> inside the Calculate RESULT dialog's DialogHeader in Dashboard.jsx (the 2-line result modal shown after Calculate Now confirmation). The confirm dialog is already fixed; only the result modal is missing it.",
+    "Note: warning fires twice, suggesting the result Dialog may be mounted/rendered in a way that duplicates the warning — verify only one DialogContent instance exists, or that a nested Dialog isn't also missing a description."
+  ],
+  "success_rate": {"backend": "not tested (skipped per request)", "frontend": "~92% (9/10 checks; only Calc Result dialog Radix warning remains)"},
+  "retest_needed": false,
+  "full_testing_deferred": true,
+  "notes": "Logout button was not explicitly asserted on client-detail page (test flow ended on client detail), but no auth-related console errors observed anywhere. EN↔हिं toggle click executed without error. Calendar/Today-Yesterday toggle not deep-tested in this pass — no visible errors during Dashboard visit."
+}

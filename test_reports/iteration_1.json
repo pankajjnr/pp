@@ -1,0 +1,29 @@
+{
+  "summary": "First-finish testing pass on Ledger Book app. Backend endpoints (login, clients, calculate, today, ledger) all return 200 with expected fields. Frontend: login (success + wrong-password error), dashboard sections, clients list + new client creation, split-view ledger (Money In on LEFT x=115, Money Out on RIGHT x=682, entries show only date+amount e.g. '2 Jul 2026 ₹10,000'), Add Payment with confirmation modal saving successfully, Calculate flow with totals (₹10,555 / ₹25,000 / -₹14,445), and logout with protected-route redirect all work. One UX bug: duplicate client submission returns 400 from backend but the modal stays open with NO visible error message to the user.",
+  "tested_scope": ["backend", "frontend", "auth", "integration"],
+  "passed": [
+    "POST /api/auth/login with correct credentials returns access_token + user",
+    "POST /api/auth/login with wrong password returns 401 and UI shows 'Invalid email or password'",
+    "GET /api/clients, /api/calculate, /api/payments/today all return 200 with expected fields",
+    "Dashboard renders today-section, yesterday-section, historical-section, historical-calendar",
+    "Clients page loads; new client created successfully and appears in list",
+    "Client detail split-view: Money In on LEFT, Money Out on RIGHT with visible layout; ledger rows show only date + ₹ amount (no time/ID/description)",
+    "Add Payment: client dropdown searchable, In/Out toggle, amount, review-entry-btn opens confirmation-dialog showing '+₹555', confirm-save-btn persists the entry",
+    "Calculate page: calculate-btn opens confirm dialog, confirm-calc-btn renders totals-result with total_incoming/outgoing/net",
+    "Logout redirects to /login and protected /clients route redirects unauthenticated user to /login"
+  ],
+  "failed": [
+    {
+      "area": "Clients / duplicate name validation UX",
+      "issue": "Submitting a duplicate client name triggers backend 400 but the Add-Client modal shows NO error message. User sees no feedback and the modal remains open, which also blocks subsequent nav clicks until dismissed.",
+      "evidence": "Console: 'Failed to load resource: 400'. Modal DOM after submit contains only labels + buttons, no error text ('already/exist/duplicate' keywords absent). Reproduced twice by submitting name 'Ravi Kumar' (existing).",
+      "priority": "MEDIUM"
+    }
+  ],
+  "action_items": [
+    "In /app/frontend/src/pages/Clients.jsx, surface the backend 400 error (e.g. 'Client with this name already exists') inside the Add-Client dialog so the user gets feedback and the modal state is handled."
+  ],
+  "success_rate": {"backend": "100%", "frontend": "~92%"},
+  "retest_needed": false,
+  "full_testing_deferred": true
+}

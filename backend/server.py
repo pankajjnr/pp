@@ -1,0 +1,661 @@
+from dotenv import load_dotenv
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+import os
+import logging
+import uuid
+import bcrypt
+import jwt
+from datetime import datetime, timezone, date, timedelta
+from typing import List, Optional, Literal
+
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi.responses import StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+import io
+import csv
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+
+# ----- Config -----
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 12  # 12 hours
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+
+mongo_url = os.environ['MONGO_URL']
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ['DB_NAME']]
+
+app = FastAPI(title="Ledger Book API")
+api_router = APIRouter(prefix="/api")
+
+
+# ----- Utilities -----
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+def get_jwt_secret() -> str:
+    return os.environ["JWT_SECRET"]
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        "type": "access",
+    }
+    return jwt.encode(payload, get_jwt_secret(), algorithm=JWT_ALGORITHM)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_local_date() -> date:
+    # Use server date as the "today" reference (Asia/Kolkata approximation is fine for now)
+    return datetime.now(timezone.utc).date()
+
+
+# ----- Models -----
+class UserPublic(BaseModel):
+    id: str
+    email: EmailStr
+    name: str
+    role: str
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserPublic
+
+
+class ClientCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class ClientOut(BaseModel):
+    id: str
+    name: str
+    note: Optional[str] = None
+    created_at: str
+    incoming_total: float = 0
+    outgoing_total: float = 0
+    net_balance: float = 0  # incoming - outgoing (money we owe them if positive? see docs)
+
+
+class PaymentCreate(BaseModel):
+    client_id: str
+    direction: Literal["in", "out"]
+    amount: float = Field(gt=0)
+    description: Optional[str] = Field(default=None, max_length=500)
+    entry_date: Optional[str] = None  # ISO date YYYY-MM-DD; defaults to today
+
+
+class PaymentOut(BaseModel):
+    id: str
+    client_id: str
+    client_name: str
+    direction: Literal["in", "out"]
+    amount: float
+    description: Optional[str] = None
+    entry_date: str  # YYYY-MM-DD
+    created_at: str
+
+
+class TotalsOut(BaseModel):
+    total_incoming: float
+    total_outgoing: float
+    net: float
+    count: int
+
+
+# ----- Auth Dependency -----
+async def get_current_user(request: Request) -> dict:
+    auth_header = request.headers.get("Authorization", "")
+    token = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    if not token:
+        token = request.cookies.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user = await db.users.find_one({"id": payload["sub"]})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def user_to_public(u: dict) -> UserPublic:
+    return UserPublic(id=u["id"], email=u["email"], name=u.get("name", "Accountant"), role=u.get("role", "accountant"))
+
+
+# ----- Brute Force Protection -----
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def check_lockout(identifier: str) -> None:
+    rec = await db.login_attempts.find_one({"identifier": identifier})
+    if not rec:
+        return
+    if rec.get("locked_until"):
+        try:
+            locked_until = datetime.fromisoformat(rec["locked_until"])
+            if locked_until > datetime.now(timezone.utc):
+                remaining = int((locked_until - datetime.now(timezone.utc)).total_seconds() / 60) + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many failed attempts. Try again in {remaining} minute(s).",
+                )
+        except (ValueError, TypeError):
+            pass
+
+
+async def record_failed_attempt(identifier: str) -> int:
+    rec = await db.login_attempts.find_one({"identifier": identifier})
+    count = (rec.get("count", 0) if rec else 0) + 1
+    update: dict = {"count": count, "last_attempt": now_iso()}
+    if count >= MAX_FAILED_ATTEMPTS:
+        update["locked_until"] = (datetime.now(timezone.utc) + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
+    await db.login_attempts.update_one(
+        {"identifier": identifier}, {"$set": update}, upsert=True
+    )
+    return count
+
+
+async def clear_failed_attempts(identifier: str) -> None:
+    await db.login_attempts.delete_one({"identifier": identifier})
+
+
+# ----- Auth Routes -----
+@api_router.post("/auth/login", response_model=TokenResponse)
+async def login(payload: LoginRequest, request: Request, response: Response):
+    email = payload.email.lower().strip()
+    ip = _client_ip(request)
+    identifier = f"{ip}:{email}"
+
+    await check_lockout(identifier)
+
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        attempts = await record_failed_attempt(identifier)
+        remaining = MAX_FAILED_ATTEMPTS - attempts
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Locked for {LOCKOUT_MINUTES} minutes.",
+            )
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid email or password. {remaining} attempt(s) remaining.",
+        )
+
+    await clear_failed_attempts(identifier)
+    token = create_access_token(user["id"], user["email"])
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+    return TokenResponse(access_token=token, user=user_to_public(user))
+
+
+@api_router.post("/auth/logout")
+async def logout(response: Response, _user: dict = Depends(get_current_user)):
+    response.delete_cookie("access_token", path="/")
+    return {"ok": True}
+
+
+@api_router.get("/auth/me", response_model=UserPublic)
+async def me(user: dict = Depends(get_current_user)):
+    return user_to_public(user)
+
+
+# ----- Client Routes -----
+async def _compute_client_totals(client_id: str) -> tuple[float, float]:
+    pipeline = [
+        {"$match": {"client_id": client_id}},
+        {"$group": {"_id": "$direction", "total": {"$sum": "$amount"}}},
+    ]
+    agg = await db.payments.aggregate(pipeline).to_list(10)
+    incoming = 0.0
+    outgoing = 0.0
+    for row in agg:
+        if row["_id"] == "in":
+            incoming = float(row["total"])
+        elif row["_id"] == "out":
+            outgoing = float(row["total"])
+    return incoming, outgoing
+
+
+@api_router.post("/clients", response_model=ClientOut)
+async def create_client(payload: ClientCreate, _user: dict = Depends(get_current_user)):
+    name = payload.name.strip()
+    existing = await db.clients.find_one({"name_lower": name.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="A client with this name already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "name_lower": name.lower(),
+        "note": (payload.note or "").strip() or None,
+        "created_at": now_iso(),
+    }
+    await db.clients.insert_one(doc)
+    return ClientOut(id=doc["id"], name=doc["name"], note=doc["note"], created_at=doc["created_at"])
+
+
+@api_router.get("/clients", response_model=List[ClientOut])
+async def list_clients(_user: dict = Depends(get_current_user)):
+    clients = await db.clients.find({}, {"_id": 0}).sort("name_lower", 1).to_list(2000)
+    result: List[ClientOut] = []
+    for c in clients:
+        incoming, outgoing = await _compute_client_totals(c["id"])
+        result.append(ClientOut(
+            id=c["id"], name=c["name"], note=c.get("note"),
+            created_at=c["created_at"],
+            incoming_total=incoming, outgoing_total=outgoing,
+            net_balance=incoming - outgoing,
+        ))
+    return result
+
+
+@api_router.get("/clients/{client_id}", response_model=ClientOut)
+async def get_client(client_id: str, _user: dict = Depends(get_current_user)):
+    c = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    incoming, outgoing = await _compute_client_totals(client_id)
+    return ClientOut(
+        id=c["id"], name=c["name"], note=c.get("note"),
+        created_at=c["created_at"],
+        incoming_total=incoming, outgoing_total=outgoing,
+        net_balance=incoming - outgoing,
+    )
+
+
+@api_router.post("/clients/bulk")
+async def bulk_create_clients(payload: dict, _user: dict = Depends(get_current_user)):
+    names = payload.get("names") or []
+    created, skipped = [], []
+    for raw in names:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        if await db.clients.find_one({"name_lower": name.lower()}):
+            skipped.append(name); continue
+        doc = {"id": str(uuid.uuid4()), "name": name, "name_lower": name.lower(),
+               "note": None, "created_at": now_iso()}
+        await db.clients.insert_one(doc)
+        created.append(name)
+    return {"created": created, "skipped": skipped}
+
+
+@api_router.delete("/clients/{client_id}")
+async def delete_client(client_id: str, user: dict = Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can delete clients")
+    c = await db.clients.find_one({"id": client_id})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    pay_res = await db.payments.delete_many({"client_id": client_id})
+    await db.clients.delete_one({"id": client_id})
+    return {"ok": True, "deleted_payments": pay_res.deleted_count, "client_name": c["name"]}
+
+
+@api_router.get("/clients/{client_id}/ledger")
+async def client_ledger(client_id: str, _user: dict = Depends(get_current_user)):
+    c = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(5000)
+    incoming = [p for p in payments if p["direction"] == "in"]
+    outgoing = [p for p in payments if p["direction"] == "out"]
+    incoming_total = sum(p["amount"] for p in incoming)
+    outgoing_total = sum(p["amount"] for p in outgoing)
+    return {
+        "client": {"id": c["id"], "name": c["name"], "note": c.get("note"), "created_at": c["created_at"]},
+        "incoming": incoming,
+        "outgoing": outgoing,
+        "incoming_total": incoming_total,
+        "outgoing_total": outgoing_total,
+        "net_balance": incoming_total - outgoing_total,
+    }
+
+
+def _fmt_inr(n: float) -> str:
+    # Indian numbering-system formatter without external deps.
+    negative = n < 0
+    n = abs(n)
+    whole = int(n)
+    frac = round(n - whole, 2)
+    s = str(whole)
+    if len(s) > 3:
+        last3 = s[-3:]
+        rest = s[:-3]
+        # group the rest by 2 from the right
+        groups = []
+        while len(rest) > 2:
+            groups.insert(0, rest[-2:])
+            rest = rest[:-2]
+        if rest:
+            groups.insert(0, rest)
+        formatted = ",".join(groups) + "," + last3
+    else:
+        formatted = s
+    if frac > 0:
+        formatted += f".{int(round(frac * 100)):02d}"
+    return ("-" if negative else "") + "Rs. " + formatted
+
+
+def _display_client_name(raw: str) -> str:
+    if not raw:
+        return raw
+    return f"Shree {raw} Ji"
+
+
+@api_router.get("/clients/{client_id}/export")
+async def export_client_ledger(client_id: str, format: str = "csv", _user: dict = Depends(get_current_user)):
+    fmt = format.lower()
+    if fmt not in ("csv", "pdf"):
+        raise HTTPException(status_code=400, detail="format must be csv or pdf")
+    c = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    display_name = _display_client_name(c["name"])
+    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(5000)
+    incoming_total = sum(p["amount"] for p in payments if p["direction"] == "in")
+    outgoing_total = sum(p["amount"] for p in payments if p["direction"] == "out")
+    net = incoming_total - outgoing_total
+
+    safe_name = "".join(ch if ch.isalnum() else "_" for ch in c["name"])[:40]
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["Client", display_name])
+        w.writerow(["Generated", now_iso()])
+        w.writerow([])
+        w.writerow(["Date", "Direction", "Amount (INR)", "Description"])
+        for p in payments:
+            w.writerow([
+                p["entry_date"],
+                "Payment Received" if p["direction"] == "in" else "Payment Given",
+                f"{p['amount']:.2f}",
+                p.get("description") or "",
+            ])
+        w.writerow([])
+        w.writerow(["Total Payment Received", f"{incoming_total:.2f}"])
+        w.writerow(["Total Payment Given", f"{outgoing_total:.2f}"])
+        w.writerow(["Net Balance", f"{net:.2f}"])
+        data = buf.getvalue().encode("utf-8")
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="ledger_{safe_name}.csv"'},
+        )
+
+    # PDF — clean, focused on client name
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=22 * mm, rightMargin=22 * mm, topMargin=24 * mm, bottomMargin=20 * mm)
+    styles = getSampleStyleSheet()
+    # Client name is the dominant focal point — huge, bold
+    name_style = ParagraphStyle("clientname", parent=styles["Title"], fontName="Times-Bold", fontSize=44, textColor=colors.HexColor("#1C1917"), spaceAfter=8, leading=48, alignment=0)
+    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#78716C"), spaceAfter=22)
+    section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, textColor=colors.HexColor("#1C1917"), spaceBefore=14, spaceAfter=8, textTransform="uppercase")
+
+    story = []
+    # ↓ removed dense "The Ledger Book" branding block
+    story.append(Paragraph(display_name, name_style))
+    story.append(Paragraph(f"Statement generated {datetime.now(timezone.utc).strftime('%d %b %Y')}", meta_style))
+
+    summary_data = [
+        ["Total Payment Received", _fmt_inr(incoming_total)],
+        ["Total Payment Given", _fmt_inr(outgoing_total)],
+        ["Net Balance", _fmt_inr(net)],
+    ]
+    t = Table(summary_data, colWidths=[90 * mm, 76 * mm])
+    t.setStyle(TableStyle([
+        ("FONT", (0, 0), (0, -1), "Helvetica", 10),
+        ("FONT", (1, 0), (1, -1), "Helvetica-Bold", 12),
+        ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#065F46")),
+        ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#9A3412")),
+        ("TEXTCOLOR", (1, 2), (1, 2), colors.HexColor("#065F46") if net >= 0 else colors.HexColor("#9A3412")),
+        ("FONT", (1, 2), (1, 2), "Helvetica-Bold", 14),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#E7E5E4")),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+    ]))
+    story.append(t)
+
+    def _rows_for(direction: str):
+        rows = [["Date", "Amount", "Description"]]
+        for p in payments:
+            if p["direction"] != direction:
+                continue
+            rows.append([p["entry_date"], _fmt_inr(p["amount"]), (p.get("description") or "")[:60]])
+        if len(rows) == 1:
+            rows.append(["—", "—", "No entries"])
+        return rows
+
+    def _table(rows, color):
+        tbl = Table(rows, colWidths=[30 * mm, 40 * mm, 96 * mm])
+        tbl.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 9),
+            ("FONT", (0, 1), (-1, -1), "Helvetica", 10),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+            ("TEXTCOLOR", (1, 1), (1, -1), color),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.7, colors.HexColor("#78716C")),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.2, colors.HexColor("#E7E5E4")),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ]))
+        return tbl
+
+    story.append(Paragraph("PAYMENT RECEIVED", section_style))
+    story.append(_table(_rows_for("in"), colors.HexColor("#065F46")))
+    story.append(Paragraph("PAYMENT GIVEN", section_style))
+    story.append(_table(_rows_for("out"), colors.HexColor("#9A3412")))
+
+    doc.build(story)
+    data = buf.getvalue()
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="ledger_{safe_name}.pdf"'},
+    )
+
+
+# ----- Payment Routes -----
+@api_router.post("/payments", response_model=PaymentOut)
+async def create_payment(payload: PaymentCreate, _user: dict = Depends(get_current_user)):
+    c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    entry_date_str = payload.entry_date or today_local_date().isoformat()
+    # validate date format
+    try:
+        datetime.strptime(entry_date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid entry_date, expected YYYY-MM-DD")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "client_id": payload.client_id,
+        "client_name": c["name"],
+        "direction": payload.direction,
+        "amount": float(payload.amount),
+        "description": (payload.description or "").strip() or None,
+        "entry_date": entry_date_str,
+        "created_at": now_iso(),
+    }
+    await db.payments.insert_one(doc)
+    return PaymentOut(**{k: doc[k] for k in ["id", "client_id", "client_name", "direction", "amount", "description", "entry_date", "created_at"]})
+
+
+@api_router.get("/payments/by-date", response_model=List[PaymentOut])
+async def payments_by_date(date_str: str, _user: dict = Depends(get_current_user)):
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date, expected YYYY-MM-DD")
+    payments = await db.payments.find({"entry_date": date_str}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return [PaymentOut(**p) for p in payments]
+
+
+@api_router.get("/payments/today", response_model=List[PaymentOut])
+async def payments_today(_user: dict = Depends(get_current_user)):
+    d = today_local_date().isoformat()
+    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return [PaymentOut(**p) for p in payments]
+
+
+@api_router.get("/payments/yesterday", response_model=List[PaymentOut])
+async def payments_yesterday(_user: dict = Depends(get_current_user)):
+    d = (today_local_date() - timedelta(days=1)).isoformat()
+    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return [PaymentOut(**p) for p in payments]
+
+
+@api_router.get("/payments/calendar-summary")
+async def payments_calendar_summary(month: str, _user: dict = Depends(get_current_user)):
+    """month = YYYY-MM. Returns dict {date: {in, out, count}} for the month."""
+    try:
+        datetime.strptime(month + "-01", "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid month, expected YYYY-MM")
+    start = month + "-01"
+    end = month + "-31"
+    payments = await db.payments.find(
+        {"entry_date": {"$gte": start, "$lte": end}}, {"_id": 0}
+    ).to_list(5000)
+    summary: dict = {}
+    for p in payments:
+        d = p["entry_date"]
+        if d not in summary:
+            summary[d] = {"in": 0.0, "out": 0.0, "count": 0}
+        summary[d]["count"] += 1
+        if p["direction"] == "in":
+            summary[d]["in"] += p["amount"]
+        else:
+            summary[d]["out"] += p["amount"]
+    return summary
+
+
+# ----- Calculate -----
+@api_router.get("/calculate", response_model=TotalsOut)
+async def calculate_totals(_user: dict = Depends(get_current_user)):
+    pipeline = [{"$group": {"_id": "$direction", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}}]
+    agg = await db.payments.aggregate(pipeline).to_list(10)
+    incoming = 0.0
+    outgoing = 0.0
+    count = 0
+    for row in agg:
+        count += row["count"]
+        if row["_id"] == "in":
+            incoming = float(row["total"])
+        elif row["_id"] == "out":
+            outgoing = float(row["total"])
+    return TotalsOut(total_incoming=incoming, total_outgoing=outgoing, net=incoming - outgoing, count=count)
+
+
+# ----- Health / Root -----
+@api_router.get("/")
+async def root():
+    return {"status": "ok", "service": "ledger-book"}
+
+
+# ----- Startup: indexes + admin seeding -----
+async def seed_admin():
+    admin_email = os.environ.get("ADMIN_EMAIL", "admin@ledger.app").lower().strip()
+    admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
+    existing = await db.users.find_one({"email": admin_email})
+    if existing is None:
+        await db.users.insert_one({
+            "id": str(uuid.uuid4()),
+            "email": admin_email,
+            "password_hash": hash_password(admin_password),
+            "name": "Accountant",
+            "role": "admin",
+            "created_at": now_iso(),
+        })
+    else:
+        updates = {}
+        if not verify_password(admin_password, existing["password_hash"]):
+            updates["password_hash"] = hash_password(admin_password)
+        if existing.get("role") != "admin":
+            updates["role"] = "admin"
+        if updates:
+            await db.users.update_one({"email": admin_email}, {"$set": updates})
+
+
+@app.on_event("startup")
+async def on_startup():
+    await db.users.create_index("email", unique=True)
+    await db.clients.create_index("name_lower", unique=True)
+    await db.payments.create_index("entry_date")
+    await db.payments.create_index("client_id")
+    await db.login_attempts.create_index("identifier", unique=True)
+    await seed_admin()
+
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
+
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)

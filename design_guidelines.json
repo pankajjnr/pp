@@ -1,0 +1,115 @@
+{
+  "theme_and_archetype": {
+    "theme": "light",
+    "archetype": "Archetype 1: Organic & Earthy",
+    "vibe": "Physical ledger book, tactile, trustworthy, grounded, focused. Avoids sterile tech 'SaaS' looks in favor of a modern analog accounting feel."
+  },
+  "colors": {
+    "background": {
+      "page": "bg-[#F9F8F6]",
+      "surface": "bg-white",
+      "surface_alt": "bg-[#F0EFEA]"
+    },
+    "text": {
+      "primary": "text-[#1C1917]",
+      "secondary": "text-[#57534E]",
+      "tertiary": "text-[#A8A29E]"
+    },
+    "accents": {
+      "incoming": "text-emerald-800",
+      "incoming_bg": "bg-emerald-50",
+      "incoming_border": "border-emerald-200",
+      "outgoing": "text-orange-800",
+      "outgoing_bg": "bg-orange-50",
+      "outgoing_border": "border-orange-200",
+      "brand_primary": "bg-[#292524] text-[#FAFAF9]",
+      "brand_hover": "hover:bg-[#1C1917] hover:text-white"
+    },
+    "borders": {
+      "default": "border-[#E7E5E4]",
+      "divider_heavy": "border-[#D6D3D1]"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "font-serif",
+      "heading_family": "Cormorant Garamond",
+      "body": "font-sans",
+      "body_family": "Work Sans",
+      "data": "font-mono",
+      "data_family": "JetBrains Mono"
+    },
+    "scales": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl font-medium tracking-tight text-[#1C1917]",
+      "h2": "text-2xl sm:text-3xl font-medium tracking-tight text-[#1C1917]",
+      "h3": "text-xl sm:text-2xl font-medium text-[#292524]",
+      "body": "text-base text-[#57534E] leading-relaxed",
+      "small": "text-sm text-[#78716C]",
+      "currency": "font-mono text-lg tracking-tight"
+    }
+  },
+  "layout_and_spacing": {
+    "strategy": "Generous spacing. The UI should breathe like a well-margined physical book.",
+    "container": "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8",
+    "section_spacing": "py-12 md:py-24",
+    "bento_grid": "grid grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6 lg:gap-8",
+    "cards": "bg-white border border-[#E7E5E4] rounded-sm shadow-sm p-6 sm:p-8"
+  },
+  "signature_components": {
+    "split_view_ledger": {
+      "description": "The signature visual moment mimicking a physical open ledger book.",
+      "structure": "A wide container split 50/50. Left side is 'Money Coming In' (Collections), Right side is 'Money Going Out' (Distributions).",
+      "divider": "A vertical center divider `border-l-2 border-[#D6D3D1] border-dashed` to represent the book binding or physical separation.",
+      "row_style": "Each entry should be a clean flex row. Date on left (small, secondary), Amount on right (mono, bold). Use 1px solid bottom border for rows to mimic lined paper.",
+      "incoming_style": "Amounts in `text-emerald-800 font-mono`.",
+      "outgoing_style": "Amounts in `text-orange-800 font-mono`.",
+      "hover_effect": "Hovering a row gives a subtle background shift to track the eye across the ledger without breaking the analog feel."
+    },
+    "calculate_module": {
+      "description": "Interactive tally system.",
+      "interaction": "User clicks 'Calculate' button -> Confirmation Modal ('Calculate totals for current view?') -> Instantly reveals a prominent sticky or modal view showing Total Incoming, Total Outgoing, and Net Balance.",
+      "visual": "Net balance should be massive (`text-5xl font-serif`) to give emotional weight to the calculation."
+    },
+    "add_payment_form": {
+      "description": "Clean, focused entry form.",
+      "style": "Should feel like writing an entry into a book. Prefer input variants with bottom-borders (`border-b border-[#D6D3D1] rounded-none bg-transparent`) over heavy filled boxes. Toggle between In/Out with clear color shifts (Emerald vs Orange)."
+    },
+    "daily_log_and_calendar": {
+      "description": "Dashboard overview.",
+      "style": "Two main lists side-by-side or stacked cleanly: 'Payment Given Today' and 'Payment Given Yesterday'. Use the interactive calendar component alongside it to pick historical dates. Calendar should use serif headers and mono numbers."
+    }
+  },
+  "component_overrides": {
+    "shadcn": {
+      "card": "Remove large border-radius. Use `rounded-sm`. Change default shadow to a very soft ambient shadow `shadow-[0_4px_20px_-4px_rgba(0,0,0,0.05)]`.",
+      "button": "Use flat colors, no gradients. Primary buttons should be `bg-[#292524] text-white hover:bg-[#1C1917]`. Cancel/Secondary: `bg-transparent border border-[#D6D3D1] text-[#292524] hover:bg-[#F9F8F6]`.",
+      "input": "Remove standard focus rings. Use `focus-visible:ring-1 focus-visible:ring-[#78716C] focus-visible:border-[#78716C]`.",
+      "dialog": "Backdrop should be `backdrop-blur-md bg-[#1C1917]/30`. Dialog panel should be `bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm`.",
+      "calendar": "Override default rounded corners to `rounded-sm`. Apply `font-serif` to month/year header and `font-mono` to dates."
+    }
+  },
+  "icons_and_media": {
+    "icon_library": "lucide-react",
+    "icon_style": "Use stroke-width 1.5 for a delicate, refined look matching the serif typography.",
+    "images": {
+      "login_background": {
+        "url": "https://images.unsplash.com/photo-1637325258040-d2f09636ecf6?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwxfHxtaW5pbWFsaXN0JTIwcGFwZXIlMjB0ZXh0dXJlfGVufDB8fHx8MTc4MzAzMTc5MXww&ixlib=rb-4.1.0&q=85",
+        "category": "background",
+        "description": "Minimalist paper texture. Use this as a subtle overlay (`opacity-30 mix-blend-multiply`) on the login screen or behind the ledger book component to add tactile warmth."
+      },
+      "login_hero": {
+        "url": "https://images.unsplash.com/photo-1533090161767-e6ffed986c88?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzJ8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMG1pbmltYWxpc3QlMjB3b3Jrc3BhY2V8ZW58MHx8fHwxNzgzMDMxNzkxfDA&ixlib=rb-4.1.0&q=85",
+        "category": "hero",
+        "description": "Abstract minimalist workspace. Use for the left half of a split-screen login page to establish a calm, focused environment for the accountant."
+      }
+    }
+  },
+  "accessibility_and_testing": {
+    "contrast": "Strict adherence to contrast ratios. Emerald-800 and Orange-800 provide excellent contrast against white/stone-50.",
+    "testing_attributes": "All interactive elements MUST include `data-testid` (e.g., `data-testid=\"login-submit-button\"`, `data-testid=\"add-payment-btn\"`, `data-testid=\"client-ledger-split-view\"`).",
+    "currency_symbol": "Always use '₹' correctly formatted with the Indian numbering system (e.g., ₹ 1,50,000)."
+  },
+  "security": {
+    "logic": "Single accountant login. JWT-based custom auth. UI must inherently hide or disable edit/delete buttons for past entries to reflect the immutable ledger requirement."
+  }
+}
