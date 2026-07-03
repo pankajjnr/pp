@@ -108,6 +108,22 @@ let webpackConfig = {
 };
 
 webpackConfig.devServer = (devServerConfig) => {
+  // Disable the "runtime errors" red overlay for benign warnings like
+  // ResizeObserver loop notifications (fired by Radix UI Popover/Command).
+  // Real compile errors still show in the terminal.
+  devServerConfig.client = {
+    ...(devServerConfig.client || {}),
+    overlay: {
+      errors: true,
+      warnings: false,
+      runtimeErrors: (error) => {
+        const msg = (error && (error.message || String(error))) || "";
+        if (msg.includes("ResizeObserver loop")) return false;
+        return true;
+      },
+    },
+  };
+
   // Add health check endpoints if enabled
   if (config.enableHealthCheck && setupHealthEndpoints && healthPluginInstance) {
     const originalSetupMiddlewares = devServerConfig.setupMiddlewares;
