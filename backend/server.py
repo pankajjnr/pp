@@ -601,6 +601,149 @@ async def calculate_totals(_user: dict = Depends(get_current_user)):
     return TotalsOut(total_incoming=incoming, total_outgoing=outgoing, net=incoming - outgoing, count=count)
 
 
+# =========================================================================
+# MATERIAL PROCUREMENT MODULE (standalone – not integrated with payments)
+# =========================================================================
+
+class ProductCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class ProductOut(BaseModel):
+    id: str
+    name: str
+    created_at: str
+
+
+class ProcurementCreate(BaseModel):
+    entry_date: str  # YYYY-MM-DD
+    client_id: str
+    product_id: str
+    weight: float = Field(gt=0)
+    rate: float = Field(gt=0)
+
+
+class ProcurementOut(BaseModel):
+    id: str
+    entry_date: str
+    client_id: str
+    client_name: str
+    product_id: str
+    product_name: str
+    weight: float
+    rate: float
+    total_amount: float
+    created_at: str
+
+
+# --- Product master ---
+@api_router.get("/procurement/products", response_model=List[ProductOut])
+async def list_products(_user: dict = Depends(get_current_user)):
+    docs = await db.master_products.find({}, {"_id": 0}).sort("name_lower", 1).to_list(500)
+    return [ProductOut(id=d["id"], name=d["name"], created_at=d["created_at"]) for d in docs]
+
+
+@api_router.post("/procurement/products", response_model=ProductOut)
+async def create_product(payload: ProductCreate, _user: dict = Depends(get_current_user)):
+    name = payload.name.strip()
+    if await db.master_products.find_one({"name_lower": name.lower()}):
+        raise HTTPException(status_code=400, detail="Product already exists")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "name_lower": name.lower(),
+        "created_at": now_iso(),
+    }
+    await db.master_products.insert_one(doc)
+    return ProductOut(id=doc["id"], name=doc["name"], created_at=doc["created_at"])
+
+
+@api_router.delete("/procurement/products/{product_id}")
+async def delete_product(product_id: str, user: dict = Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admin can delete products")
+    res = await db.master_products.delete_one({"id": product_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return {"ok": True}
+
+
+# --- Procurement entries ---
+@api_router.post("/procurement/entries", response_model=ProcurementOut)
+async def create_procurement(payload: ProcurementCreate, _user: dict = Depends(get_current_user)):
+    try:
+        datetime.strptime(payload.entry_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
+
+    c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+    p = await db.master_products.find_one({"id": payload.product_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    total_amount = round(float(payload.weight) * float(payload.rate), 2)
+    doc = {
+        "id": str(uuid.uuid4()),
+        "entry_date": payload.entry_date,
+        "client_id": payload.client_id,
+        "client_name": c["name"],
+        "product_id": payload.product_id,
+        "product_name": p["name"],
+        "weight": float(payload.weight),
+        "rate": float(payload.rate),
+        "total_amount": total_amount,
+        "created_at": now_iso(),
+    }
+    await db.procurement_entries.insert_one(doc)
+    return ProcurementOut(**{k: doc[k] for k in [
+        "id", "entry_date", "client_id", "client_name", "product_id",
+        "product_name", "weight", "rate", "total_amount", "created_at"
+    ]})
+
+
+@api_router.get("/procurement/entries", response_model=List[ProcurementOut])
+async def list_procurement(
+    client_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    product_name: Optional[str] = None,
+    entry_date: Optional[str] = None,
+    _user: dict = Depends(get_current_user),
+):
+    """Dynamically filter procurement entries by any combination of
+    client_id, product_id (or product_name), and entry_date."""
+    q: dict = {}
+    if client_id:
+        q["client_id"] = client_id
+    if product_id:
+        q["product_id"] = product_id
+    elif product_name:
+        q["product_name"] = product_name
+    if entry_date:
+        try:
+            datetime.strptime(entry_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
+        q["entry_date"] = entry_date
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return [ProcurementOut(**r) for r in rows]
+
+
+DEFAULT_PRODUCTS = ["Maize", "Wheat", "Bajra"]
+
+
+async def seed_products():
+    for name in DEFAULT_PRODUCTS:
+        if not await db.master_products.find_one({"name_lower": name.lower()}):
+            await db.master_products.insert_one({
+                "id": str(uuid.uuid4()),
+                "name": name,
+                "name_lower": name.lower(),
+                "created_at": now_iso(),
+            })
+
+
 # ----- Health / Root -----
 @api_router.get("/")
 async def root():
@@ -638,7 +781,12 @@ async def on_startup():
     await db.payments.create_index("entry_date")
     await db.payments.create_index("client_id")
     await db.login_attempts.create_index("identifier", unique=True)
+    await db.master_products.create_index("name_lower", unique=True)
+    await db.procurement_entries.create_index("entry_date")
+    await db.procurement_entries.create_index("client_id")
+    await db.procurement_entries.create_index("product_id")
     await seed_admin()
+    await seed_products()
 
 
 @app.on_event("shutdown")

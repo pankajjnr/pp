@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 
@@ -29,6 +29,9 @@ export default function Layout() {
   const navItems = [
     { to: "/", label: t("nav.dailyLog"), icon: BookOpen, testid: "nav-dashboard" },
     { to: "/clients", label: t("nav.clients"), icon: Users, testid: "nav-clients" },
+    { to: "/procurement/log", label: "Procurement Log", icon: ClipboardList, testid: "nav-procurement-log" },
+    { to: "/procurement/client-subledger", label: "Client Subledger", icon: ScrollText, testid: "nav-client-subledger" },
+    { to: "/procurement/product-ledger", label: "Product Ledger", icon: Wheat, testid: "nav-product-ledger" },
   ];
 
   const handleLogout = async () => {
