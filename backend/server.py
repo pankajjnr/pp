@@ -730,6 +730,108 @@ async def list_procurement(
     return [ProcurementOut(**r) for r in rows]
 
 
+@api_router.get("/procurement/entries/export")
+async def export_procurement(
+    entry_date: Optional[str] = None,
+    _user: dict = Depends(get_current_user),
+):
+    """Export procurement entries as PDF.
+    Optional entry_date=YYYY-MM-DD narrows it to that day; omit for full history.
+    """
+    q: dict = {}
+    scope_label = "Full History"
+    if entry_date:
+        try:
+            datetime.strptime(entry_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
+        q["entry_date"] = entry_date
+        scope_label = entry_date
+
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", -1).sort("created_at", -1).to_list(10000)
+    total_weight = sum(float(r.get("weight", 0)) for r in rows)
+    total_cost = sum(float(r.get("total_amount", 0)) for r in rows)
+    wavg = (total_cost / total_weight) if total_weight > 0 else 0.0
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
+                            topMargin=20 * mm, bottomMargin=18 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("title", parent=styles["Title"], fontName="Times-Bold",
+                                 fontSize=26, textColor=colors.HexColor("#1C1917"),
+                                 spaceAfter=4, leading=30, alignment=0)
+    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica",
+                                fontSize=9, textColor=colors.HexColor("#78716C"), spaceAfter=14)
+    section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                                   fontSize=10, textColor=colors.HexColor("#1C1917"),
+                                   spaceBefore=12, spaceAfter=6)
+
+    story = [
+        Paragraph("Procurement Log", title_style),
+        Paragraph(
+            f"Scope: {scope_label} &nbsp;·&nbsp; Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}",
+            meta_style,
+        ),
+    ]
+
+    # Summary block
+    summary_rows = [
+        ["Total Entries", str(len(rows))],
+        ["Total Weight (Quintal)", f"{total_weight:,.2f}"],
+        ["Total Cost", _fmt_inr(total_cost)],
+        ["Weighted Avg Rate (Rs./Quintal)", _fmt_inr(wavg) if total_weight > 0 else "—"],
+    ]
+    st = Table(summary_rows, colWidths=[90 * mm, 76 * mm])
+    st.setStyle(TableStyle([
+        ("FONT", (0, 0), (0, -1), "Helvetica", 10),
+        ("FONT", (1, 0), (1, -1), "Helvetica-Bold", 11),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#57534E")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#E7E5E4")),
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+    ]))
+    story.append(st)
+
+    story.append(Paragraph("ENTRIES", section_style))
+    header = ["Date", "Client", "Product", "Weight (Qtl)", "Rate", "Total"]
+    data = [header]
+    if not rows:
+        data.append(["—", "—", "—", "—", "—", "No entries"])
+    else:
+        for r in rows:
+            data.append([
+                r["entry_date"],
+                _display_client_name(r.get("client_name", "")),
+                r.get("product_name", ""),
+                f"{float(r.get('weight', 0)):,.2f}",
+                _fmt_inr(float(r.get("rate", 0))),
+                _fmt_inr(float(r.get("total_amount", 0))),
+            ])
+    tbl = Table(data, colWidths=[24 * mm, 46 * mm, 26 * mm, 24 * mm, 26 * mm, 28 * mm], repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8.5),
+        ("FONT", (0, 1), (-1, -1), "Helvetica", 9),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F4F0")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.HexColor("#78716C")),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.2, colors.HexColor("#E7E5E4")),
+        ("ALIGN", (3, 0), (5, -1), "RIGHT"),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(tbl)
+
+    doc.build(story)
+    data_bytes = buf.getvalue()
+    filename = f"procurement_{scope_label.replace(' ', '_')}.pdf"
+    return StreamingResponse(
+        io.BytesIO(data_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 DEFAULT_PRODUCTS = ["Maize", "Wheat", "Bajra"]
 
 

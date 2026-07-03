@@ -172,8 +172,8 @@ export default function ProductLedger() {
               <tr>
                 <th className="text-left px-5 py-3 font-medium">#</th>
                 <th className="text-left px-5 py-3 font-medium">Client Name</th>
-                <th className="text-right px-5 py-3 font-medium">Weight (kg)</th>
-                <th className="text-right px-5 py-3 font-medium">Rate (₹/kg)</th>
+                <th className="text-right px-5 py-3 font-medium">Weight (Qtl)</th>
+                <th className="text-right px-5 py-3 font-medium">Rate (₹/Qtl)</th>
                 <th className="text-right px-5 py-3 font-medium">Total Amount</th>
               </tr>
             </thead>
@@ -220,7 +220,7 @@ export default function ProductLedger() {
             Summary · {activeProduct?.name} · {displayDate}
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
-            <Stat label="Total Weight Bought" value={`${summary.weight.toLocaleString("en-IN")} kg`} testid="summary-weight" />
+            <Stat label="Total Weight Bought" value={`${summary.weight.toLocaleString("en-IN")} qtl`} testid="summary-weight" />
             <Stat label="Total Cost Spent" value={formatCurrency(summary.cost)} testid="summary-cost" />
             <Stat label="Entries" value={String(summary.count)} testid="summary-count" mono />
           </div>
@@ -241,10 +241,10 @@ export default function ProductLedger() {
                 <span className="font-serif text-4xl text-[#1C1917]" data-testid="wavg-value">
                   {formatCurrency(avgRate.value)}
                 </span>
-                <span className="text-sm text-stone-500 font-mono">/ kg</span>
+                <span className="text-sm text-stone-500 font-mono">/ Quintal</span>
               </div>
               <div className="text-xs font-mono text-stone-500">
-                = {formatCurrency(avgRate.totalCost)} (total cost) ÷ {avgRate.totalWeight.toLocaleString("en-IN")} kg (total weight)
+                = {formatCurrency(avgRate.totalCost)} (total cost) ÷ {avgRate.totalWeight.toLocaleString("en-IN")} qtl (total weight)
               </div>
             </div>
           )}

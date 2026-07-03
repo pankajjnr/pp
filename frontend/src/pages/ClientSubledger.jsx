@@ -108,8 +108,8 @@ export default function ClientSubledger() {
                   <th className="text-left px-5 py-3 font-medium">#</th>
                   <th className="text-left px-5 py-3 font-medium">Date</th>
                   <th className="text-left px-5 py-3 font-medium">Product</th>
-                  <th className="text-right px-5 py-3 font-medium">Weight (kg)</th>
-                  <th className="text-right px-5 py-3 font-medium">Rate (₹/kg)</th>
+                  <th className="text-right px-5 py-3 font-medium">Weight (Qtl)</th>
+                  <th className="text-right px-5 py-3 font-medium">Rate (₹/Qtl)</th>
                   <th className="text-right px-5 py-3 font-medium">Total Amount</th>
                 </tr>
               </thead>
