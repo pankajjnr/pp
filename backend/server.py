@@ -669,12 +669,25 @@ async def delete_product(product_id: str, user: dict = Depends(get_current_user)
 
 
 # --- Procurement entries ---
+def _allowed_entry_dates() -> set[str]:
+    """Procurement entries may only be logged for today or yesterday."""
+    today = today_local_date()
+    return {today.isoformat(), (today - timedelta(days=1)).isoformat()}
+
+
 @api_router.post("/procurement/entries", response_model=ProcurementOut)
 async def create_procurement(payload: ProcurementCreate, _user: dict = Depends(get_current_user)):
     try:
         datetime.strptime(payload.entry_date, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
+
+    allowed = _allowed_entry_dates()
+    if payload.entry_date not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Procurement entries can only be logged for today or yesterday.",
+        )
 
     c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
     if not c:
@@ -835,6 +848,152 @@ async def export_procurement(
 DEFAULT_PRODUCTS = ["Maize", "Wheat", "Bajra"]
 
 
+# =========================================================================
+# PROCUREMENT PAYMENT SETTLEMENT (watermark-based, standalone)
+# =========================================================================
+
+class SettlementCreate(BaseModel):
+    client_id: str
+    cutoff_date: str  # YYYY-MM-DD
+    deduction_percent: float = Field(ge=0, le=100)
+
+
+class SettlementOut(BaseModel):
+    id: str
+    client_id: str
+    client_name: str
+    settled_from_date: Optional[str] = None  # exclusive lower bound (prev watermark); None = never settled before
+    settled_to_date: str                     # cutoff_date (inclusive)
+    entry_count: int
+    gross_amount: float
+    deduction_percent: float
+    deduction_amount: float
+    net_paid: float
+    created_at: str
+
+
+class OutstandingPreview(BaseModel):
+    client_id: str
+    client_name: str
+    settled_from_date: Optional[str] = None  # exclusive lower bound
+    cutoff_date: str
+    entry_count: int
+    gross_amount: float
+
+
+async def _current_watermark(client_id: str) -> Optional[str]:
+    """Return the most recent settled_to_date for this client, else None."""
+    rec = await db.procurement_settlements.find_one(
+        {"client_id": client_id},
+        {"_id": 0, "settled_to_date": 1},
+        sort=[("settled_to_date", -1)],
+    )
+    return rec["settled_to_date"] if rec else None
+
+
+async def _outstanding_query(client_id: str, cutoff_date: str) -> tuple[list[dict], Optional[str]]:
+    """Return (eligible_entries, watermark) for the given client+cutoff."""
+    watermark = await _current_watermark(client_id)
+    q: dict = {"client_id": client_id, "entry_date": {"$lte": cutoff_date}}
+    if watermark:
+        q["entry_date"]["$gt"] = watermark
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    return rows, watermark
+
+
+@api_router.get("/procurement/clients/{client_id}/outstanding", response_model=OutstandingPreview)
+async def preview_outstanding(
+    client_id: str,
+    cutoff_date: str,
+    _user: dict = Depends(get_current_user),
+):
+    try:
+        datetime.strptime(cutoff_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cutoff_date (YYYY-MM-DD)")
+    c = await db.clients.find_one({"id": client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    rows, watermark = await _outstanding_query(client_id, cutoff_date)
+    gross = round(sum(float(r.get("total_amount", 0)) for r in rows), 2)
+    return OutstandingPreview(
+        client_id=client_id,
+        client_name=c["name"],
+        settled_from_date=watermark,
+        cutoff_date=cutoff_date,
+        entry_count=len(rows),
+        gross_amount=gross,
+    )
+
+
+@api_router.post("/procurement/settlements", response_model=SettlementOut)
+async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get_current_user)):
+    try:
+        datetime.strptime(payload.cutoff_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid cutoff_date (YYYY-MM-DD)")
+
+    c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
+    if not c:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    watermark = await _current_watermark(payload.client_id)
+    if watermark and payload.cutoff_date <= watermark:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Already settled up to {watermark}. Choose a cutoff date after that.",
+        )
+
+    rows, _ = await _outstanding_query(payload.client_id, payload.cutoff_date)
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No unsettled procurement entries in this window — nothing to settle.",
+        )
+
+    gross = round(sum(float(r.get("total_amount", 0)) for r in rows), 2)
+    ded_pct = float(payload.deduction_percent)
+    deduction = round(gross * ded_pct / 100.0, 2)
+    net = round(gross - deduction, 2)
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "client_id": payload.client_id,
+        "client_name": c["name"],
+        "settled_from_date": watermark,
+        "settled_to_date": payload.cutoff_date,
+        "entry_count": len(rows),
+        "gross_amount": gross,
+        "deduction_percent": ded_pct,
+        "deduction_amount": deduction,
+        "net_paid": net,
+        "created_at": now_iso(),
+    }
+    await db.procurement_settlements.insert_one(doc)
+    return SettlementOut(**{k: doc[k] for k in [
+        "id", "client_id", "client_name", "settled_from_date", "settled_to_date",
+        "entry_count", "gross_amount", "deduction_percent", "deduction_amount",
+        "net_paid", "created_at",
+    ]})
+
+
+@api_router.get("/procurement/settlements", response_model=List[SettlementOut])
+async def list_settlements(
+    client_id: Optional[str] = None,
+    _user: dict = Depends(get_current_user),
+):
+    q: dict = {}
+    if client_id:
+        q["client_id"] = client_id
+    rows = await db.procurement_settlements.find(q, {"_id": 0}).sort("settled_to_date", -1).to_list(5000)
+    return [SettlementOut(**{k: r.get(k) for k in [
+        "id", "client_id", "client_name", "settled_from_date", "settled_to_date",
+        "entry_count", "gross_amount", "deduction_percent", "deduction_amount",
+        "net_paid", "created_at",
+    ]}) for r in rows]
+
+
 async def seed_products():
     for name in DEFAULT_PRODUCTS:
         if not await db.master_products.find_one({"name_lower": name.lower()}):
@@ -887,6 +1046,7 @@ async def on_startup():
     await db.procurement_entries.create_index("entry_date")
     await db.procurement_entries.create_index("client_id")
     await db.procurement_entries.create_index("product_id")
+    await db.procurement_settlements.create_index([("client_id", 1), ("settled_to_date", -1)])
     await seed_admin()
     await seed_products()
 

@@ -13,6 +13,7 @@ import AddPayment from "@/pages/AddPayment";
 import ProcurementLog from "@/pages/ProcurementLog";
 import ClientSubledger from "@/pages/ClientSubledger";
 import ProductLedger from "@/pages/ProductLedger";
+import ProcurementSettlement from "@/pages/ProcurementSettlement";
 function App() {
   return (
     <div className="App">
@@ -31,6 +32,7 @@ function App() {
                 <Route path="procurement/log" element={<ProcurementLog />} />
                 <Route path="procurement/client-subledger" element={<ClientSubledger />} />
                 <Route path="procurement/product-ledger" element={<ProductLedger />} />
+                <Route path="procurement/settlement" element={<ProcurementSettlement />} />
               </Route>
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

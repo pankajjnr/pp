@@ -22,6 +22,7 @@ function toIsoDate(d) {
  */
 export default function ProcurementLog() {
   const todayIso = toIsoDate(new Date());
+  const yesterdayIso = toIsoDate(new Date(Date.now() - 86400000));
 
   const [clients, setClients] = useState([]);
   const [products, setProducts] = useState([]);
@@ -168,8 +169,9 @@ export default function ProcurementLog() {
           {/* Date */}
           <FormField label="Date" icon={<CalendarDays strokeWidth={1.5} className="w-3.5 h-3.5" />}>
             <input type="date" value={entryDate} onChange={(e) => setEntryDate(e.target.value)}
-              max={todayIso} data-testid="procurement-date-input" required
+              min={yesterdayIso} max={todayIso} data-testid="procurement-date-input" required
               className="w-full bg-transparent border-b border-[#D6D3D1] py-2 font-mono text-sm focus:outline-none focus:border-[#292524]" />
+            <p className="mt-1 text-[10px] text-stone-400">Only today or yesterday allowed</p>
           </FormField>
 
           {/* Client dropdown */}
