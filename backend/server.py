@@ -849,107 +849,197 @@ DEFAULT_PRODUCTS = ["Maize", "Wheat", "Bajra"]
 
 
 # =========================================================================
-# PROCUREMENT PAYMENT SETTLEMENT (watermark-based, standalone)
+# PROCUREMENT PAYMENT SETTLEMENT (date-range based, auto-posts to ledger)
 # =========================================================================
 
 class SettlementCreate(BaseModel):
     client_id: str
-    cutoff_date: str  # YYYY-MM-DD
+    from_date: str  # YYYY-MM-DD (inclusive)
+    to_date: str    # YYYY-MM-DD (inclusive)
     deduction_percent: float = Field(ge=0, le=100)
+
+
+class SettlementEntryRef(BaseModel):
+    id: str
+    entry_date: str
+    product_id: str
+    product_name: str
+    weight: float
+    rate: float
+    total_amount: float
+
+
+class ProductSubtotal(BaseModel):
+    product_id: str
+    product_name: str
+    entry_count: int
+    total_weight: float
+    total_amount: float
 
 
 class SettlementOut(BaseModel):
     id: str
     client_id: str
     client_name: str
-    settled_from_date: Optional[str] = None  # exclusive lower bound (prev watermark); None = never settled before
-    settled_to_date: str                     # cutoff_date (inclusive)
+    from_date: str
+    to_date: str
     entry_count: int
     gross_amount: float
     deduction_percent: float
     deduction_amount: float
     net_paid: float
+    linked_payment_id: Optional[str] = None
     created_at: str
+
+
+class SettlementDetailOut(SettlementOut):
+    entries: List[SettlementEntryRef] = []
+    subtotals: List[ProductSubtotal] = []
 
 
 class OutstandingPreview(BaseModel):
     client_id: str
     client_name: str
-    settled_from_date: Optional[str] = None  # exclusive lower bound
-    cutoff_date: str
+    from_date: str
+    to_date: str
     entry_count: int
     gross_amount: float
+    entries: List[SettlementEntryRef]
+    subtotals: List[ProductSubtotal]
 
 
-async def _current_watermark(client_id: str) -> Optional[str]:
-    """Return the most recent settled_to_date for this client, else None."""
+class LastSettlementOut(BaseModel):
+    from_date: str
+    to_date: str
+    created_at: str
+
+
+def _validate_iso_date(value: str, field: str) -> None:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {field} (YYYY-MM-DD)")
+
+
+async def _fetch_eligible_entries(client_id: str, from_date: str, to_date: str) -> List[dict]:
+    """Entries for client, entry_date in [from,to], NOT already settled.
+    Missing/absent `is_settled` field is treated as False (unsettled)."""
+    rows = await db.procurement_entries.find({
+        "client_id": client_id,
+        "entry_date": {"$gte": from_date, "$lte": to_date},
+        "is_settled": {"$ne": True},
+    }, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    return rows
+
+
+def _compute_subtotals(rows: List[dict]) -> List[ProductSubtotal]:
+    agg: dict[str, dict] = {}
+    for r in rows:
+        pid = r.get("product_id", "")
+        if pid not in agg:
+            agg[pid] = {
+                "product_id": pid,
+                "product_name": r.get("product_name", ""),
+                "entry_count": 0,
+                "total_weight": 0.0,
+                "total_amount": 0.0,
+            }
+        agg[pid]["entry_count"] += 1
+        agg[pid]["total_weight"] += float(r.get("weight", 0))
+        agg[pid]["total_amount"] += float(r.get("total_amount", 0))
+    result = []
+    for a in agg.values():
+        result.append(ProductSubtotal(
+            product_id=a["product_id"],
+            product_name=a["product_name"],
+            entry_count=a["entry_count"],
+            total_weight=round(a["total_weight"], 2),
+            total_amount=round(a["total_amount"], 2),
+        ))
+    result.sort(key=lambda s: s.product_name.lower())
+    return result
+
+
+def _to_entry_refs(rows: List[dict]) -> List[SettlementEntryRef]:
+    return [SettlementEntryRef(
+        id=r["id"],
+        entry_date=r["entry_date"],
+        product_id=r.get("product_id", ""),
+        product_name=r.get("product_name", ""),
+        weight=float(r.get("weight", 0)),
+        rate=float(r.get("rate", 0)),
+        total_amount=float(r.get("total_amount", 0)),
+    ) for r in rows]
+
+
+@api_router.get(
+    "/procurement/clients/{client_id}/last-settlement",
+    response_model=Optional[LastSettlementOut],
+)
+async def last_settlement(client_id: str, _user: dict = Depends(get_current_user)):
+    """Purely informational: most recent settlement's window for this client."""
     rec = await db.procurement_settlements.find_one(
-        {"client_id": client_id},
-        {"_id": 0, "settled_to_date": 1},
-        sort=[("settled_to_date", -1)],
+        {"client_id": client_id, "from_date": {"$exists": True}},
+        {"_id": 0, "from_date": 1, "to_date": 1, "created_at": 1},
+        sort=[("to_date", -1), ("created_at", -1)],
     )
-    return rec["settled_to_date"] if rec else None
+    if not rec:
+        return None
+    return LastSettlementOut(
+        from_date=rec["from_date"], to_date=rec["to_date"], created_at=rec["created_at"]
+    )
 
 
-async def _outstanding_query(client_id: str, cutoff_date: str) -> tuple[list[dict], Optional[str]]:
-    """Return (eligible_entries, watermark) for the given client+cutoff."""
-    watermark = await _current_watermark(client_id)
-    q: dict = {"client_id": client_id, "entry_date": {"$lte": cutoff_date}}
-    if watermark:
-        q["entry_date"]["$gt"] = watermark
-    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", 1).to_list(20000)
-    return rows, watermark
-
-
-@api_router.get("/procurement/clients/{client_id}/outstanding", response_model=OutstandingPreview)
+@api_router.get(
+    "/procurement/clients/{client_id}/outstanding",
+    response_model=OutstandingPreview,
+)
 async def preview_outstanding(
     client_id: str,
-    cutoff_date: str,
+    from_date: str,
+    to_date: str,
     _user: dict = Depends(get_current_user),
 ):
-    try:
-        datetime.strptime(cutoff_date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid cutoff_date (YYYY-MM-DD)")
+    _validate_iso_date(from_date, "from_date")
+    _validate_iso_date(to_date, "to_date")
+    if from_date > to_date:
+        raise HTTPException(status_code=400, detail="from_date cannot be after to_date")
+
     c = await db.clients.find_one({"id": client_id}, {"_id": 0})
     if not c:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    rows, watermark = await _outstanding_query(client_id, cutoff_date)
+    rows = await _fetch_eligible_entries(client_id, from_date, to_date)
     gross = round(sum(float(r.get("total_amount", 0)) for r in rows), 2)
     return OutstandingPreview(
         client_id=client_id,
         client_name=c["name"],
-        settled_from_date=watermark,
-        cutoff_date=cutoff_date,
+        from_date=from_date,
+        to_date=to_date,
         entry_count=len(rows),
         gross_amount=gross,
+        entries=_to_entry_refs(rows),
+        subtotals=_compute_subtotals(rows),
     )
 
 
 @api_router.post("/procurement/settlements", response_model=SettlementOut)
 async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get_current_user)):
-    try:
-        datetime.strptime(payload.cutoff_date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid cutoff_date (YYYY-MM-DD)")
+    _validate_iso_date(payload.from_date, "from_date")
+    _validate_iso_date(payload.to_date, "to_date")
+    if payload.from_date > payload.to_date:
+        raise HTTPException(status_code=400, detail="from_date cannot be after to_date")
 
     c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
     if not c:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    watermark = await _current_watermark(payload.client_id)
-    if watermark and payload.cutoff_date <= watermark:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Already settled up to {watermark}. Choose a cutoff date after that.",
-        )
-
-    rows, _ = await _outstanding_query(payload.client_id, payload.cutoff_date)
+    # Re-fetch server-side — never trust a client-side preview.
+    rows = await _fetch_eligible_entries(payload.client_id, payload.from_date, payload.to_date)
     if not rows:
         raise HTTPException(
             status_code=400,
-            detail="No unsettled procurement entries in this window — nothing to settle.",
+            detail="No unsettled procurement entries in this range — nothing to settle.",
         )
 
     gross = round(sum(float(r.get("total_amount", 0)) for r in rows), 2)
@@ -957,25 +1047,93 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
     deduction = round(gross * ded_pct / 100.0, 2)
     net = round(gross - deduction, 2)
 
-    doc = {
-        "id": str(uuid.uuid4()),
+    settlement_id = str(uuid.uuid4())
+    payment_id = str(uuid.uuid4())
+    entry_ids = [r["id"] for r in rows]
+    today_iso = today_local_date().isoformat()
+    created_ts = now_iso()
+
+    payment_doc = {
+        "id": payment_id,
         "client_id": payload.client_id,
         "client_name": c["name"],
-        "settled_from_date": watermark,
-        "settled_to_date": payload.cutoff_date,
+        "direction": "out",
+        "amount": net,
+        "description": (
+            f"Procurement settlement — material dated {payload.from_date} "
+            f"to {payload.to_date} (deduction {ded_pct}%)"
+        ),
+        "entry_date": today_iso,
+        "created_at": created_ts,
+        "settlement_id": settlement_id,  # extra field; ignored by PaymentOut model
+    }
+
+    settlement_doc = {
+        "id": settlement_id,
+        "client_id": payload.client_id,
+        "client_name": c["name"],
+        "from_date": payload.from_date,
+        "to_date": payload.to_date,
         "entry_count": len(rows),
         "gross_amount": gross,
         "deduction_percent": ded_pct,
         "deduction_amount": deduction,
         "net_paid": net,
-        "created_at": now_iso(),
+        "linked_payment_id": payment_id,
+        "entry_ids": entry_ids,
+        "created_at": created_ts,
     }
-    await db.procurement_settlements.insert_one(doc)
-    return SettlementOut(**{k: doc[k] for k in [
-        "id", "client_id", "client_name", "settled_from_date", "settled_to_date",
-        "entry_count", "gross_amount", "deduction_percent", "deduction_amount",
-        "net_paid", "created_at",
-    ]})
+
+    # Best-effort "atomic" sequence — rollback on any failure to avoid
+    # ending up with entries flagged settled but no ledger payment / settlement record.
+    flagged = False
+    payment_inserted = False
+    settlement_inserted = False
+    try:
+        upd = await db.procurement_entries.update_many(
+            {"id": {"$in": entry_ids}, "is_settled": {"$ne": True}},
+            {"$set": {"is_settled": True, "settlement_id": settlement_id}},
+        )
+        # Guard: race — someone else settled in between. Roll back everything.
+        if upd.modified_count != len(entry_ids):
+            raise RuntimeError("Entry count mismatch — concurrent settlement suspected")
+        flagged = True
+
+        await db.payments.insert_one(payment_doc)
+        payment_inserted = True
+
+        await db.procurement_settlements.insert_one(settlement_doc)
+        settlement_inserted = True
+    except Exception as exc:
+        # Reverse in the opposite order.
+        if settlement_inserted:
+            await db.procurement_settlements.delete_one({"id": settlement_id})
+        if payment_inserted:
+            await db.payments.delete_one({"id": payment_id})
+        if flagged:
+            await db.procurement_entries.update_many(
+                {"settlement_id": settlement_id},
+                {"$set": {"is_settled": False}, "$unset": {"settlement_id": ""}},
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Settlement failed and was rolled back: {exc}",
+        )
+
+    return SettlementOut(
+        id=settlement_id,
+        client_id=payload.client_id,
+        client_name=c["name"],
+        from_date=payload.from_date,
+        to_date=payload.to_date,
+        entry_count=len(rows),
+        gross_amount=gross,
+        deduction_percent=ded_pct,
+        deduction_amount=deduction,
+        net_paid=net,
+        linked_payment_id=payment_id,
+        created_at=created_ts,
+    )
 
 
 @api_router.get("/procurement/settlements", response_model=List[SettlementOut])
@@ -983,15 +1141,40 @@ async def list_settlements(
     client_id: Optional[str] = None,
     _user: dict = Depends(get_current_user),
 ):
-    q: dict = {}
+    q: dict = {"from_date": {"$exists": True}}  # ignore any legacy watermark records
     if client_id:
         q["client_id"] = client_id
-    rows = await db.procurement_settlements.find(q, {"_id": 0}).sort("settled_to_date", -1).to_list(5000)
-    return [SettlementOut(**{k: r.get(k) for k in [
-        "id", "client_id", "client_name", "settled_from_date", "settled_to_date",
-        "entry_count", "gross_amount", "deduction_percent", "deduction_amount",
-        "net_paid", "created_at",
-    ]}) for r in rows]
+    rows = await db.procurement_settlements.find(q, {"_id": 0}).sort("to_date", -1).sort("created_at", -1).to_list(5000)
+    out = []
+    for r in rows:
+        out.append(SettlementOut(
+            id=r["id"], client_id=r["client_id"], client_name=r["client_name"],
+            from_date=r["from_date"], to_date=r["to_date"],
+            entry_count=r["entry_count"], gross_amount=r["gross_amount"],
+            deduction_percent=r["deduction_percent"], deduction_amount=r["deduction_amount"],
+            net_paid=r["net_paid"], linked_payment_id=r.get("linked_payment_id"),
+            created_at=r["created_at"],
+        ))
+    return out
+
+
+@api_router.get("/procurement/settlements/{settlement_id}", response_model=SettlementDetailOut)
+async def get_settlement(settlement_id: str, _user: dict = Depends(get_current_user)):
+    r = await db.procurement_settlements.find_one({"id": settlement_id, "from_date": {"$exists": True}}, {"_id": 0})
+    if not r:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+    entry_ids = r.get("entry_ids") or []
+    entries = await db.procurement_entries.find({"id": {"$in": entry_ids}}, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    return SettlementDetailOut(
+        id=r["id"], client_id=r["client_id"], client_name=r["client_name"],
+        from_date=r["from_date"], to_date=r["to_date"],
+        entry_count=r["entry_count"], gross_amount=r["gross_amount"],
+        deduction_percent=r["deduction_percent"], deduction_amount=r["deduction_amount"],
+        net_paid=r["net_paid"], linked_payment_id=r.get("linked_payment_id"),
+        created_at=r["created_at"],
+        entries=_to_entry_refs(entries),
+        subtotals=_compute_subtotals(entries),
+    )
 
 
 async def seed_products():
@@ -1046,7 +1229,18 @@ async def on_startup():
     await db.procurement_entries.create_index("entry_date")
     await db.procurement_entries.create_index("client_id")
     await db.procurement_entries.create_index("product_id")
-    await db.procurement_settlements.create_index([("client_id", 1), ("settled_to_date", -1)])
+    await db.procurement_settlements.create_index([("client_id", 1), ("to_date", -1)])
+    # One-time cleanup: drop legacy watermark-style settlement records and
+    # clear any lingering is_settled flags that referenced them, so we start
+    # the new date-range settlement model from a clean slate.
+    legacy = await db.procurement_settlements.delete_many(
+        {"from_date": {"$exists": False}}
+    )
+    if legacy.deleted_count:
+        await db.procurement_entries.update_many(
+            {"is_settled": True},
+            {"$set": {"is_settled": False}, "$unset": {"settlement_id": ""}},
+        )
     await seed_admin()
     await seed_products()
 
