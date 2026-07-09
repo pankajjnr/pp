@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Users, Check, ChevronsUpDown, Package, FileDown, CalendarDays } from "lucide-react";
+import { Users, Check, ChevronsUpDown, Package, FileDown, CalendarDays, Inbox } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import EmptyState from "@/components/EmptyState";
+import StatCard from "@/components/StatCard";
+import { useLang } from "@/context/LangContext";
+import usePageTitle from "@/hooks/usePageTitle";
 import { cn } from "@/lib/utils";
 
 function toIsoDate(d) {
@@ -20,6 +24,8 @@ function toIsoDate(d) {
  * Export a product-wise PDF for any date range.
  */
 export default function ClientSubledger() {
+  const { t } = useLang();
+  usePageTitle("sub.title", { isKey: true });
   const todayIso = toIsoDate(new Date());
 
   const [clients, setClients] = useState([]);
@@ -101,13 +107,13 @@ export default function ClientSubledger() {
     <div className="space-y-8" data-testid="client-subledger-page">
       <header className="flex items-baseline justify-between border-b border-[#E7E5E4] pb-4">
         <div>
-          <div className="text-xs uppercase tracking-widest text-stone-500">Module 02</div>
-          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="client-subledger-title">Client Subledger</h1>
-          <p className="text-sm text-stone-500 mt-1">Every kilogram bought from a single hand — in order.</p>
+          <div className="text-xs uppercase tracking-widest text-stone-500">{t("proc.module")} 02</div>
+          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="client-subledger-title">{t("sub.title")}</h1>
+          <p className="text-sm text-stone-500 mt-1">{t("sub.subtitle")}</p>
         </div>
         {selectedClient && (
           <span className="font-mono text-xs uppercase tracking-widest text-stone-500">
-            {sorted.length} procurement rows
+            {sorted.length} {t("sub.rows")}
           </span>
         )}
       </header>
@@ -115,23 +121,23 @@ export default function ClientSubledger() {
       {/* Client picker */}
       <section className="bg-white border border-[#E7E5E4] p-5 space-y-4">
         <label className="text-[11px] uppercase tracking-widest text-stone-500 flex items-center gap-1.5">
-          <Users strokeWidth={1.5} className="w-3.5 h-3.5" /> Choose a client
+          <Users strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("sub.chooseClient")}
         </label>
         <Popover open={popOpen} onOpenChange={setPopOpen}>
           <PopoverTrigger asChild>
             <button type="button" data-testid="subledger-client-trigger"
               className="w-full md:w-96 flex justify-between items-center bg-transparent border-b border-[#D6D3D1] py-2 text-lg focus:outline-none focus:border-[#292524]">
               <span className={cn(!selectedClient && "text-stone-400")}>
-                {selectedClient ? formatClientName(selectedClient.name) : "Select a client to view subledger…"}
+                {selectedClient ? formatClientName(selectedClient.name) : t("sub.selectPrompt")}
               </span>
               <ChevronsUpDown strokeWidth={1.5} className="w-4 h-4 text-stone-500" />
             </button>
           </PopoverTrigger>
           <PopoverContent className="p-0 w-[--radix-popover-trigger-width] bg-white border-[#E7E5E4]">
             <Command>
-              <CommandInput placeholder="Search client…" data-testid="subledger-client-search" />
+              <CommandInput placeholder={t("proc.searchClient")} data-testid="subledger-client-search" />
               <CommandList>
-                <CommandEmpty>No clients found.</CommandEmpty>
+                <CommandEmpty>{t("add.noClients")}</CommandEmpty>
                 <CommandGroup>
                   {clients.map((c) => (
                     <CommandItem key={c.id} value={c.name}
@@ -150,10 +156,19 @@ export default function ClientSubledger() {
 
       {selectedClient && (
         <>
+          {/* Summary stat cards */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4" data-testid="subledger-stats">
+            <StatCard label={t("sub.stat.entries")} value={String(sorted.length)} testid="sub-stat-entries" />
+            <StatCard label={t("sub.stat.weight")} value={`${totals.weight.toLocaleString("en-IN")} ${t("proc.qtl").toLowerCase()}`} testid="sub-stat-weight" />
+            <StatCard label={t("sub.stat.amount")} value={formatCurrency(totals.amount)} tone="positive" emphasis testid="sub-stat-amount" />
+            <StatCard label={t("sub.stat.products")}
+              value={String(new Set(sorted.map(r => r.product_name)).size)} testid="sub-stat-products" />
+          </div>
+
           {/* Filter + export toolbar */}
           <div className="flex flex-wrap items-center gap-3" data-testid="subledger-toolbar">
             <label className="text-[11px] uppercase tracking-widest text-stone-500 flex items-center gap-1.5">
-              <Package strokeWidth={1.5} className="w-3.5 h-3.5" /> Product filter
+              <Package strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("sub.productFilter")}
             </label>
             <button type="button"
               onClick={() => setProductFilter("")}
@@ -163,7 +178,7 @@ export default function ClientSubledger() {
                 productFilter === "" ? "bg-[#292524] text-[#FAFAF9] border-[#292524]"
                                      : "border-[#D6D3D1] text-[#292524] hover:bg-[#F0EFEA]"
               )}>
-              All Products
+              {t("proc.allProducts")}
             </button>
             {products.map((p) => (
               <button key={p.id} type="button"
@@ -180,17 +195,17 @@ export default function ClientSubledger() {
 
             <button onClick={() => setExportOpen(true)}
               data-testid="subledger-download-btn"
-              className="ml-auto inline-flex items-center gap-2 border border-[#292524] text-[#292524] px-4 py-1.5 text-xs uppercase tracking-widest hover:bg-[#292524] hover:text-white transition-colors">
+              className="ml-auto inline-flex items-center gap-2 border border-[#B45309] text-[#B45309] px-4 py-1.5 text-xs uppercase tracking-widest hover:bg-[#B45309] hover:text-white transition-colors">
               <FileDown strokeWidth={1.5} className="w-3.5 h-3.5" />
-              Download PDF
+              {t("sub.downloadPdf")}
             </button>
           </div>
 
           {/* Table */}
           <section className="bg-white border border-[#E7E5E4]" data-testid="subledger-panel">
-            <div className="px-5 py-3 border-b border-[#E7E5E4] flex items-center justify-between">
+            <div className="px-5 py-3 border-b border-[#E7E5E4] bg-[#F5F4F0] flex items-center justify-between">
               <h2 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold" data-testid="subledger-heading">
-                Subledger — {formatClientName(selectedClient.name)}
+                {t("sub.headingBase")} — {formatClientName(selectedClient.name)}
                 {productFilter && (
                   <span className="ml-2 text-xs text-stone-500 normal-case font-normal">
                     · {products.find((p) => p.id === productFilter)?.name}
@@ -198,27 +213,28 @@ export default function ClientSubledger() {
                 )}
               </h2>
               <span className="text-xs text-stone-500 font-mono">
-                {loading ? "Loading…" : `${sorted.length} rows`}
+                {loading ? t("action.loading") : `${sorted.length} ${t("sub.rows")}`}
               </span>
             </div>
 
             <div className="overflow-x-auto">
               <table className="w-full text-sm" data-testid="subledger-table">
-                <thead className="bg-[#F5F4F0] text-[11px] uppercase tracking-widest text-stone-500">
+                <thead className="bg-[#F5F4F0] text-[11px] uppercase tracking-widest text-stone-500 border-b border-[#E7E5E4]">
                   <tr>
                     <th className="text-left px-5 py-3 font-medium">#</th>
-                    <th className="text-left px-5 py-3 font-medium">Date</th>
-                    <th className="text-left px-5 py-3 font-medium">Product</th>
-                    <th className="text-right px-5 py-3 font-medium">Weight (Qtl)</th>
-                    <th className="text-right px-5 py-3 font-medium">Rate (₹/Qtl)</th>
-                    <th className="text-right px-5 py-3 font-medium">Total Amount</th>
+                    <th className="text-left px-5 py-3 font-medium">{t("proc.date")}</th>
+                    <th className="text-left px-5 py-3 font-medium">{t("proc.product")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.weight")} ({t("proc.qtl")})</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.rate")} (₹/{t("proc.qtl")})</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.totalAmount")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#E7E5E4]">
                   {sorted.length === 0 && !loading ? (
-                    <tr><td colSpan={6} className="text-center py-10 text-stone-500 italic">
-                      No procurement entries for this client
-                      {productFilter && " under this product"}.
+                    <tr><td colSpan={6} className="p-0">
+                      <EmptyState icon={Inbox}
+                        label={`${t("sub.emptyForClient")}${productFilter ? " " + t("sub.emptyUnderProduct") : ""}.`}
+                        testid="subledger-empty" />
                     </td></tr>
                   ) : sorted.map((r, i) => (
                     <tr key={r.id} className="hover:bg-[#FAFAF9]" data-testid={`subledger-row-${r.id}`}>
@@ -232,14 +248,14 @@ export default function ClientSubledger() {
                   ))}
                 </tbody>
                 {sorted.length > 0 && (
-                  <tfoot className="bg-[#FAFAF9] border-t-2 border-[#78716C] text-[#1C1917]">
+                  <tfoot className="bg-[#FEF3C7] border-t-2 border-[#B45309]">
                     <tr data-testid="subledger-totals-row">
-                      <td colSpan={3} className="px-5 py-3 text-[11px] uppercase tracking-widest text-stone-500">Totals</td>
-                      <td className="px-5 py-3 text-right font-mono font-semibold" data-testid="subledger-total-weight">
+                      <td colSpan={3} className="px-5 py-3 text-[11px] uppercase tracking-widest text-[#92400E]">{t("sub.totals")}</td>
+                      <td className="px-5 py-3 text-right font-mono font-bold text-[#B45309]" data-testid="subledger-total-weight">
                         {totals.weight.toLocaleString("en-IN")}
                       </td>
                       <td></td>
-                      <td className="px-5 py-3 text-right font-mono font-semibold" data-testid="subledger-total-amount">
+                      <td className="px-5 py-3 text-right font-mono font-bold text-lg text-[#B45309]" data-testid="subledger-total-amount">
                         {formatCurrency(totals.amount)}
                       </td>
                     </tr>
@@ -255,18 +271,18 @@ export default function ClientSubledger() {
       <Dialog open={exportOpen} onOpenChange={setExportOpen}>
         <DialogContent className="bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm max-w-md" data-testid="export-dialog">
           <DialogHeader>
-            <DialogTitle className="text-2xl font-serif text-[#1C1917]">Download Product-wise PDF</DialogTitle>
+            <DialogTitle className="text-2xl font-serif text-[#1C1917]">{t("sub.export.title")}</DialogTitle>
             <DialogDescription className="text-sm text-stone-500">
-              {selectedClient && <>For <strong>{formatClientName(selectedClient.name)}</strong> · </>}
+              {selectedClient && <>{t("sub.export.for")} <strong>{formatClientName(selectedClient.name)}</strong> · </>}
               {productFilter
-                ? <>Product: <strong>{products.find((p) => p.id === productFilter)?.name}</strong></>
-                : <>All products</>}
+                ? <>{t("sub.export.product")}: <strong>{products.find((p) => p.id === productFilter)?.name}</strong></>
+                : <>{t("sub.export.productAll")}</>}
             </DialogDescription>
           </DialogHeader>
           <div className="grid grid-cols-2 gap-4 py-2">
             <div>
               <label className="text-[11px] uppercase tracking-widest text-stone-500 flex items-center gap-1.5">
-                <CalendarDays strokeWidth={1.5} className="w-3.5 h-3.5" /> From
+                <CalendarDays strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("sub.export.from")}
               </label>
               <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)}
                 max={todayIso} data-testid="export-from-input"
@@ -274,7 +290,7 @@ export default function ClientSubledger() {
             </div>
             <div>
               <label className="text-[11px] uppercase tracking-widest text-stone-500 flex items-center gap-1.5">
-                <CalendarDays strokeWidth={1.5} className="w-3.5 h-3.5" /> To
+                <CalendarDays strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("sub.export.to")}
               </label>
               <input type="date" value={toDate} onChange={(e) => setToDate(e.target.value)}
                 max={todayIso} data-testid="export-to-input"
@@ -284,12 +300,12 @@ export default function ClientSubledger() {
           <DialogFooter className="gap-2 pt-4">
             <button onClick={() => setExportOpen(false)} data-testid="export-cancel-btn"
               className="border border-[#D6D3D1] text-[#292524] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#F0EFEA]">
-              Cancel
+              {t("sub.export.cancel")}
             </button>
             <button onClick={downloadPdf} disabled={downloading} data-testid="export-confirm-btn"
-              className="bg-[#292524] text-[#FAFAF9] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#1C1917] disabled:opacity-60 inline-flex items-center gap-2">
+              className="bg-[#B45309] text-[#FAFAF9] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-60 inline-flex items-center gap-2">
               <FileDown strokeWidth={1.5} className="w-4 h-4" />
-              {downloading ? "Preparing…" : "Download PDF"}
+              {downloading ? t("sub.export.preparing") : t("sub.export.confirm")}
             </button>
           </DialogFooter>
         </DialogContent>

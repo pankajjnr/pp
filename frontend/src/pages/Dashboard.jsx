@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet } from "lucide-react";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Calendar } from "@/components/ui/calendar";
 import { toast } from "sonner";
 import { useLang } from "@/context/LangContext";
+import StatCard from "@/components/StatCard";
+import usePageTitle from "@/hooks/usePageTitle";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
@@ -172,6 +174,7 @@ function PaymentColumn({ items, emptyMsg, tone, testid }) {
 
 export default function Dashboard() {
   const { t, lang } = useLang();
+  usePageTitle("nav.dailyLog", { isKey: true });
   const [activeDate, setActiveDate] = useState(new Date());
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -181,6 +184,12 @@ export default function Dashboard() {
   const [calcTotals, setCalcTotals] = useState(null);
   const [calendarMonth, setCalendarMonth] = useState(new Date());
   const [focusColumn, setFocusColumn] = useState(null); // "in" | "out" | null
+
+  // Dashboard-level stats (Edit 1 + Edit 7)
+  const [todayProcurement, setTodayProcurement] = useState({ count: 0, weight: 0, cost: 0 });
+  const [muddatBalance, setMuddatBalance] = useState(0);
+  const [recentActivity, setRecentActivity] = useState([]);
+
   const today = new Date();
   today.setHours(23, 59, 59, 999);
 
@@ -197,6 +206,41 @@ export default function Dashboard() {
   };
 
   useEffect(() => { fetchPayments(); }, [activeDateStr]);
+
+  // Load Dashboard-level stats + recent activity (once)
+  useEffect(() => {
+    const todayIso = toIsoDate(new Date());
+    (async () => {
+      try {
+        const [procRes, clientsRes] = await Promise.all([
+          api.get(`/procurement/entries?entry_date=${todayIso}`),
+          api.get("/clients"),
+        ]);
+        const rows = procRes.data || [];
+        setTodayProcurement({
+          count: rows.length,
+          weight: rows.reduce((s, r) => s + Number(r.weight || 0), 0),
+          cost: rows.reduce((s, r) => s + Number(r.total_amount || 0), 0),
+        });
+        const muddat = (clientsRes.data || []).find(
+          (c) => (c.name || "").toLowerCase() === "muddat"
+        );
+        if (muddat) {
+          try {
+            const led = await api.get(`/clients/${muddat.id}/ledger`);
+            setMuddatBalance(Number(led.data?.incoming_total || 0));
+          } catch { /* ignore */ }
+        }
+        // Recent activity — combine today's procurement + payments, latest first
+        const activity = [
+          ...rows.map((r) => ({ kind: "procurement", when: r.created_at,
+            title: `${r.product_name} · ${r.weight} qtl · ${formatClientName(r.client_name)}`,
+            amount: r.total_amount, tone: "muted" })),
+        ];
+        setRecentActivity(activity.sort((a, b) => b.when.localeCompare(a.when)).slice(0, 5));
+      } catch (e) { /* silent */ }
+    })();
+  }, []);
 
   const received = payments.filter((p) => p.direction === "in");
   const given = payments.filter((p) => p.direction === "out");
@@ -219,6 +263,52 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6" data-testid="dashboard-page">
+      {/* Page eyebrow + title (Edit 7) */}
+      <header className="border-b border-[#E7E5E4] pb-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500">{t("dashboard.eyebrow")}</div>
+        <h1 className="mt-1 text-3xl font-serif text-[#1C1917]">{t("dashboard.title")}</h1>
+      </header>
+
+      {/* Summary stat cards (Edit 1) */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4" data-testid="dashboard-stats">
+        <StatCard label={t("dashboard.stat.procuredToday")}
+          value={formatCurrency(todayProcurement.cost)}
+          subvalue={`${todayProcurement.weight.toLocaleString("en-IN")} qtl · ${todayProcurement.count} ${t("proc.entries")}`}
+          tone="positive" emphasis testid="dash-stat-procured" />
+        <StatCard label={t("dashboard.stat.paymentsToday")}
+          value={formatCurrency(given.reduce((s, p) => s + p.amount, 0))}
+          subvalue={`${given.length} ${t("dashboard.entries")}`}
+          tone="negative" testid="dash-stat-paid" />
+        <StatCard label={t("dashboard.stat.receivedToday")}
+          value={formatCurrency(received.reduce((s, p) => s + p.amount, 0))}
+          subvalue={`${received.length} ${t("dashboard.entries")}`}
+          tone="positive" testid="dash-stat-received" />
+        <StatCard label={t("dashboard.stat.muddat")}
+          value={formatCurrency(muddatBalance)}
+          subvalue="Deductions collected"
+          tone="positive" testid="dash-stat-muddat" />
+      </div>
+
+      {/* Recent activity */}
+      {recentActivity.length > 0 && (
+        <section className="bg-white border border-[#E7E5E4]" data-testid="dashboard-recent">
+          <div className="px-5 py-3 border-b border-[#E7E5E4] bg-[#F5F4F0]">
+            <h2 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold">{t("dashboard.recent.title")}</h2>
+          </div>
+          <ul className="divide-y divide-[#E7E5E4]">
+            {recentActivity.map((a, i) => (
+              <li key={i} className="px-5 py-3 flex items-center justify-between text-sm">
+                <div className="flex items-center gap-3">
+                  <Wheat strokeWidth={1.5} className="w-4 h-4 text-stone-400" />
+                  <span className="text-[#1C1917]">{a.title}</span>
+                </div>
+                <span className="font-mono text-[#B45309]">{formatCurrency(a.amount)}</span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {/* Toolbar — left-aligned */}
       <div className="flex flex-wrap items-center gap-2" data-testid="toolbar">
         <button onClick={() => setActiveDate(new Date())} className={btn(activeDateStr === todayStr)} data-testid="today-btn">{t("tb.today")}</button>

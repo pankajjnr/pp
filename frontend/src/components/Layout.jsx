@@ -29,10 +29,10 @@ export default function Layout() {
   const navItems = [
     { to: "/", label: t("nav.dailyLog"), icon: BookOpen, testid: "nav-dashboard" },
     { to: "/clients", label: t("nav.clients"), icon: Users, testid: "nav-clients" },
-    { to: "/procurement/log", label: "Procurement Log", icon: ClipboardList, testid: "nav-procurement-log" },
-    { to: "/procurement/client-subledger", label: "Client Subledger", icon: ScrollText, testid: "nav-client-subledger" },
-    { to: "/procurement/product-ledger", label: "Product Ledger", icon: Wheat, testid: "nav-product-ledger" },
-    { to: "/procurement/settlement", label: "Settlement", icon: Wallet, testid: "nav-settlement" },
+    { to: "/procurement/log", label: t("nav.procurementLog"), icon: ClipboardList, testid: "nav-procurement-log" },
+    { to: "/procurement/client-subledger", label: t("nav.clientSubledger"), icon: ScrollText, testid: "nav-client-subledger" },
+    { to: "/procurement/product-ledger", label: t("nav.productLedger"), icon: Wheat, testid: "nav-product-ledger" },
+    { to: "/procurement/settlement", label: t("nav.settlement"), icon: Wallet, testid: "nav-settlement" },
   ];
 
   const handleLogout = async () => {

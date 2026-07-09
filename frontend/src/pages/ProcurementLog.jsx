@@ -9,6 +9,9 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { useAuth } from "@/context/AuthContext";
+import { useLang } from "@/context/LangContext";
+import usePageTitle from "@/hooks/usePageTitle";
+import EmptyState from "@/components/EmptyState";
 import { cn } from "@/lib/utils";
 
 function toIsoDate(d) {
@@ -29,6 +32,8 @@ function toIsoDate(d) {
  */
 export default function ProcurementLog() {
   const { user } = useAuth();
+  const { t } = useLang();
+  usePageTitle("log.title", { isKey: true });
   const isAdmin = user?.role === "admin";
 
   const todayIso = toIsoDate(new Date());
@@ -233,25 +238,25 @@ export default function ProcurementLog() {
       {/* Header */}
       <header className="flex flex-wrap items-baseline justify-between gap-4 border-b border-[#E7E5E4] pb-4">
         <div>
-          <div className="text-xs uppercase tracking-widest text-stone-500">Module 01</div>
-          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="procurement-log-title">Procurement Log</h1>
-          <p className="text-sm text-stone-500 mt-1">Weight × Rate — every quintal, every rupee, recorded once.</p>
+          <div className="text-xs uppercase tracking-widest text-stone-500">{t("proc.module")} 01</div>
+          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="procurement-log-title">{t("log.title")}</h1>
+          <p className="text-sm text-stone-500 mt-1">{t("log.subtitle")}</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           <button onClick={() => setManageOpen(true)} data-testid="manage-products-btn"
             className="inline-flex items-center gap-2 border border-[#D6D3D1] text-[#292524] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#F0EFEA] transition-colors">
-            <Settings strokeWidth={1.5} className="w-3.5 h-3.5" /> Manage Products
+            <Settings strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("log.manageProducts")}
           </button>
           <button onClick={() => downloadPdf({ todayOnly: true })} disabled={downloading || todaysEntries.length === 0}
             data-testid="download-today-pdf-btn"
             className="inline-flex items-center gap-2 border border-[#D6D3D1] text-[#292524] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#F0EFEA] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
-            <Download strokeWidth={1.5} className="w-3.5 h-3.5" /> Today PDF
+            <Download strokeWidth={1.5} className="w-3.5 h-3.5" /> {t("log.todayPdf")}
           </button>
           <button onClick={() => downloadPdf({ todayOnly: false })} disabled={downloading}
             data-testid="download-all-pdf-btn"
-            className="inline-flex items-center gap-2 bg-[#292524] text-[#FAFAF9] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#1C1917] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+            className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             <FileDown strokeWidth={1.5} className="w-3.5 h-3.5" />
-            {downloading ? "Preparing…" : "Full Data PDF"}
+            {downloading ? t("log.preparing") : t("log.fullPdf")}
           </button>
         </div>
       </header>
@@ -362,9 +367,9 @@ export default function ProcurementLog() {
             <div className="text-[11px] font-mono text-stone-400 mt-0.5">= weight (qtl) × rate (₹/qtl)</div>
           </div>
           <button type="submit" data-testid="procurement-submit-btn"
-            className="inline-flex items-center gap-2 bg-[#292524] text-[#FAFAF9] px-6 py-3 text-sm uppercase tracking-widest hover:bg-[#1C1917] transition-colors">
+            className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-6 py-3 text-sm uppercase tracking-widest hover:bg-[#92400E] transition-colors">
             <Plus strokeWidth={1.5} className="w-4 h-4" />
-            Review & Save
+            {t("log.reviewAndSave")}
           </button>
         </div>
       </form>
@@ -490,7 +495,7 @@ export default function ProcurementLog() {
                   Cancel / Edit
                 </button>
                 <button onClick={confirmSave} disabled={saving} data-testid="review-save-btn"
-                  className="bg-[#292524] text-[#FAFAF9] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#1C1917] disabled:opacity-60 inline-flex items-center gap-2">
+                  className="bg-[#B45309] text-[#FAFAF9] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-60 inline-flex items-center gap-2">
                   <Check strokeWidth={1.5} className="w-4 h-4" />
                   {saving ? "Saving…" : "Save Entry"}
                 </button>
@@ -575,12 +580,12 @@ function TodayGrandTotal({ rows }) {
   const totalWeight = rows.reduce((s, r) => s + Number(r.weight || 0), 0);
   const totalCost = rows.reduce((s, r) => s + Number(r.total_amount || 0), 0);
   return (
-    <div className="px-5 py-3 bg-[#1C1917] text-[#FAFAF9] flex flex-wrap justify-between gap-x-8 gap-y-1 text-xs uppercase tracking-widest"
+    <div className="px-5 py-4 bg-[#FEF3C7] border-2 border-[#B45309] flex flex-wrap justify-between gap-x-8 gap-y-1 text-xs uppercase tracking-widest text-[#92400E]"
       data-testid="today-grand-total">
-      <div>Today&apos;s Total Weight: <span className="font-mono ml-1" data-testid="today-total-weight">
+      <div>Today&apos;s Total Weight: <span className="font-mono ml-1 text-2xl font-bold text-[#B45309]" data-testid="today-total-weight">
         {totalWeight.toLocaleString("en-IN")} qtl
       </span></div>
-      <div>Today&apos;s Total Cost: <span className="font-mono ml-1" data-testid="today-total-cost">
+      <div>Today&apos;s Total Cost: <span className="font-mono ml-1 text-2xl font-bold text-[#B45309]" data-testid="today-total-cost">
         {formatCurrency(totalCost)}
       </span></div>
     </div>

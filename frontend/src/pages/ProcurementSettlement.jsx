@@ -8,6 +8,9 @@ import api, { formatCurrency, formatDate, formatApiError, formatClientName } fro
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
+import EmptyState from "@/components/EmptyState";
+import { useLang } from "@/context/LangContext";
+import usePageTitle from "@/hooks/usePageTitle";
 import { cn } from "@/lib/utils";
 
 function toIsoDate(d) {
@@ -29,6 +32,8 @@ const PRESETS = [
  * so it can never be double-paid, regardless of overlapping ranges.
  */
 export default function ProcurementSettlement() {
+  const { t } = useLang();
+  usePageTitle("set.title", { isKey: true });
   const todayIso = toIsoDate(new Date());
 
   const [clients, setClients] = useState([]);
@@ -139,11 +144,9 @@ export default function ProcurementSettlement() {
     <div className="space-y-8" data-testid="procurement-settlement-page">
       <header className="flex items-baseline justify-between border-b border-[#E7E5E4] pb-4">
         <div>
-          <div className="text-xs uppercase tracking-widest text-stone-500">Module 04</div>
-          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="settlement-title">Payment Settlement</h1>
-          <p className="text-sm text-stone-500 mt-1">
-            Pay a client for procurement in a specific date range. Auto-posted to the client&apos;s subledger.
-          </p>
+          <div className="text-xs uppercase tracking-widest text-stone-500">{t("proc.module")} 04</div>
+          <h1 className="mt-1 text-3xl font-serif text-[#1C1917]" data-testid="settlement-title">{t("set.title")}</h1>
+          <p className="text-sm text-stone-500 mt-1">{t("set.subtitle")}</p>
         </div>
       </header>
 
@@ -261,15 +264,15 @@ export default function ProcurementSettlement() {
             data-testid="preview-btn"
             className="inline-flex items-center gap-2 border border-[#292524] text-[#292524] px-5 py-2.5 text-sm uppercase tracking-widest hover:bg-[#292524] hover:text-white disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-[#292524] transition-colors">
             <ListChecks strokeWidth={1.5} className="w-4 h-4" />
-            {loadingPreview ? "Loading…" : "Show Entries"}
+            {loadingPreview ? t("action.loading") : t("set.showEntries")}
           </button>
 
           <button onClick={confirmSettle}
             disabled={!preview || preview.entry_count === 0 || confirming || deductionPercent === null}
             data-testid="confirm-settle-btn"
-            className="inline-flex items-center gap-2 bg-[#292524] text-[#FAFAF9] px-5 py-2.5 text-sm uppercase tracking-widest hover:bg-[#1C1917] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+            className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-5 py-2.5 text-sm uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
             <Check strokeWidth={1.5} className="w-4 h-4" />
-            {confirming ? "Settling…" : "Confirm & Settle"}
+            {confirming ? t("set.settling") : t("set.confirmSettle")}
           </button>
 
           {selectedClient && (
@@ -289,30 +292,30 @@ export default function ProcurementSettlement() {
       {/* Settlement history */}
       {selectedClient && (
         <section className="bg-white border border-[#E7E5E4]" data-testid="settlement-history-panel">
-          <div className="px-5 py-3 border-b border-[#E7E5E4] flex items-center justify-between">
+          <div className="px-5 py-3 border-b border-[#E7E5E4] bg-[#F5F4F0] flex items-center justify-between">
             <h2 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold flex items-center gap-2">
               <History strokeWidth={1.5} className="w-4 h-4" />
-              Settlement History — {formatClientName(selectedClient.name)}
+              {t("set.history")} — {formatClientName(selectedClient.name)}
             </h2>
-            <span className="text-xs text-stone-500 font-mono">{settlements.length} settlements</span>
+            <span className="text-xs text-stone-500 font-mono">{settlements.length} {t("set.historyCount")}</span>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm" data-testid="settlement-history-table">
               <thead className="bg-[#F5F4F0] text-[11px] uppercase tracking-widest text-stone-500">
                 <tr>
-                  <th className="text-left px-5 py-3 font-medium">Settled On</th>
-                  <th className="text-left px-5 py-3 font-medium">From → To</th>
-                  <th className="text-right px-5 py-3 font-medium">Entries</th>
-                  <th className="text-right px-5 py-3 font-medium">Gross</th>
-                  <th className="text-right px-5 py-3 font-medium">Ded.%</th>
-                  <th className="text-right px-5 py-3 font-medium">Deduction</th>
-                  <th className="text-right px-5 py-3 font-medium">Net Paid</th>
+                  <th className="text-left px-5 py-3 font-medium">{t("set.settledOn")}</th>
+                  <th className="text-left px-5 py-3 font-medium">{t("set.window")}</th>
+                  <th className="text-right px-5 py-3 font-medium">{t("set.entries")}</th>
+                  <th className="text-right px-5 py-3 font-medium">{t("set.gross")}</th>
+                  <th className="text-right px-5 py-3 font-medium">{t("set.deductionPctShort")}</th>
+                  <th className="text-right px-5 py-3 font-medium">{t("set.deduction")}</th>
+                  <th className="text-right px-5 py-3 font-medium">{t("set.netPaid")}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#E7E5E4]">
                 {settlements.length === 0 ? (
-                  <tr><td colSpan={7} className="text-center py-8 text-stone-500 italic">
-                    No settlements recorded for this client yet.
+                  <tr><td colSpan={7} className="p-0">
+                    <EmptyState icon={History} label={t("set.emptyHistory")} testid="settlement-history-empty" />
                   </td></tr>
                 ) : settlements.map((s) => (
                   <tr key={s.id} className="hover:bg-[#FAFAF9]" data-testid={`settlement-row-${s.id}`}>
@@ -325,8 +328,8 @@ export default function ProcurementSettlement() {
                     <td className="px-5 py-3 text-right font-mono">{s.entry_count}</td>
                     <td className="px-5 py-3 text-right font-mono">{formatCurrency(s.gross_amount)}</td>
                     <td className="px-5 py-3 text-right font-mono">{s.deduction_percent}%</td>
-                    <td className="px-5 py-3 text-right font-mono text-orange-800">− {formatCurrency(s.deduction_amount)}</td>
-                    <td className="px-5 py-3 text-right font-mono font-semibold">{formatCurrency(s.net_paid)}</td>
+                    <td className="px-5 py-3 text-right font-mono text-[#9F1D1D]">− {formatCurrency(s.deduction_amount)}</td>
+                    <td className="px-5 py-3 text-right font-mono font-bold text-[#B45309]">{formatCurrency(s.net_paid)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -369,47 +372,53 @@ export default function ProcurementSettlement() {
 }
 
 function PreviewPanel({ preview, math, deductionPercent }) {
+  const { t } = useLang();
   const empty = preview.entry_count === 0;
   return (
     <section className="space-y-6" data-testid="preview-panel">
       <div className="bg-white border border-[#E7E5E4] p-6">
         <div className="text-xs uppercase tracking-widest text-stone-500 mb-4">
-          Outstanding · {formatClientName(preview.client_name)} · <span className="font-mono">{formatDate(preview.from_date)} → {formatDate(preview.to_date)}</span>
+          {t("set.outstanding")} · {formatClientName(preview.client_name)} · <span className="font-mono">{formatDate(preview.from_date)} → {formatDate(preview.to_date)}</span>
         </div>
 
         {empty ? (
           <div className="flex items-start gap-3 bg-orange-50 border border-orange-200 p-4 text-sm text-orange-900" data-testid="preview-empty">
             <AlertTriangle strokeWidth={1.5} className="w-4 h-4 mt-0.5 flex-shrink-0" />
             <div>
-              No unsettled procurement entries between <strong>{formatDate(preview.from_date)}</strong> and <strong>{formatDate(preview.to_date)}</strong>. Nothing to settle.
+              {t("set.noneInRange")} <strong>{formatDate(preview.from_date)}</strong> {t("set.andBetween")} <strong>{formatDate(preview.to_date)}</strong>. {t("set.nothingToSettle")}
             </div>
           </div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-            <Stat label="Unpaid entries" value={String(preview.entry_count)} testid="preview-count" mono />
-            <Stat label="Gross amount" value={formatCurrency(math.gross)} testid="preview-gross" mono />
-            <Stat label={`Deduction (${deductionPercent}%)`} value={`− ${formatCurrency(math.deduction)}`} testid="preview-deduction" mono tone="orange" />
-            <Stat label="Net payable" value={formatCurrency(math.net)} testid="preview-net" mono emphasis />
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Stat label={t("set.unpaidEntries")} value={String(preview.entry_count)} testid="preview-count" mono />
+            <Stat label={t("set.gross")} value={formatCurrency(math.gross)} testid="preview-gross" mono />
+            <Stat label={`${t("set.deduction")} (${deductionPercent}%)`}
+              value={`− ${formatCurrency(math.deduction)}`} testid="preview-deduction" mono tone="negative" />
+            <div className="col-span-2 md:col-span-1 bg-[#FEF3C7] border-2 border-[#B45309] p-4">
+              <div className="text-[10px] uppercase tracking-widest text-[#92400E]">{t("set.netPayable")}</div>
+              <div className="mt-1 font-mono font-bold text-3xl text-[#B45309]" data-testid="preview-net">
+                {formatCurrency(math.net)}
+              </div>
+            </div>
           </div>
         )}
       </div>
 
       {!empty && (
         <>
-          {/* Product subtotals */}
           <div className="bg-white border border-[#E7E5E4]" data-testid="preview-subtotals">
-            <div className="px-5 py-3 border-b border-[#E7E5E4] flex items-center gap-2">
+            <div className="px-5 py-3 border-b border-[#E7E5E4] bg-[#F5F4F0] flex items-center gap-2">
               <Package strokeWidth={1.5} className="w-4 h-4 text-[#1C1917]" />
-              <h3 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold">Product-wise Subtotals</h3>
+              <h3 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold">{t("set.productSubtotals")}</h3>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-[#F5F4F0] text-[11px] uppercase tracking-widest text-stone-500">
                   <tr>
-                    <th className="text-left px-5 py-3 font-medium">Product</th>
-                    <th className="text-right px-5 py-3 font-medium">Entries</th>
-                    <th className="text-right px-5 py-3 font-medium">Total Weight (Qtl)</th>
-                    <th className="text-right px-5 py-3 font-medium">Total Amount</th>
+                    <th className="text-left px-5 py-3 font-medium">{t("proc.product")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.entries")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("set.totalWeight")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.totalAmount")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#E7E5E4]">
@@ -426,24 +435,23 @@ function PreviewPanel({ preview, math, deductionPercent }) {
             </div>
           </div>
 
-          {/* Every eligible entry */}
           <div className="bg-white border border-[#E7E5E4]" data-testid="preview-entries">
-            <div className="px-5 py-3 border-b border-[#E7E5E4] flex items-center justify-between">
+            <div className="px-5 py-3 border-b border-[#E7E5E4] bg-[#F5F4F0] flex items-center justify-between">
               <h3 className="text-sm uppercase tracking-widest text-[#1C1917] font-bold flex items-center gap-2">
                 <ListChecks strokeWidth={1.5} className="w-4 h-4" />
-                Eligible Entries
+                {t("set.eligibleEntries")}
               </h3>
-              <span className="text-xs text-stone-500 font-mono">{preview.entries.length} rows</span>
+              <span className="text-xs text-stone-500 font-mono">{preview.entries.length} {t("sub.rows")}</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-[#F5F4F0] text-[11px] uppercase tracking-widest text-stone-500">
                   <tr>
-                    <th className="text-left px-5 py-3 font-medium">Date</th>
-                    <th className="text-left px-5 py-3 font-medium">Product</th>
-                    <th className="text-right px-5 py-3 font-medium">Weight (Qtl)</th>
-                    <th className="text-right px-5 py-3 font-medium">Rate</th>
-                    <th className="text-right px-5 py-3 font-medium">Amount</th>
+                    <th className="text-left px-5 py-3 font-medium">{t("proc.date")}</th>
+                    <th className="text-left px-5 py-3 font-medium">{t("proc.product")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.weight")} ({t("proc.qtl")})</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.rate")}</th>
+                    <th className="text-right px-5 py-3 font-medium">{t("proc.amount")}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#E7E5E4]">
@@ -467,7 +475,10 @@ function PreviewPanel({ preview, math, deductionPercent }) {
 }
 
 function Stat({ label, value, testid, mono, emphasis, tone }) {
-  const toneColor = tone === "orange" ? "text-orange-800" : "text-[#1C1917]";
+  const toneColor =
+    tone === "negative" ? "text-[#9F1D1D]" :
+    tone === "positive" ? "text-[#B45309]" :
+    "text-[#1C1917]";
   return (
     <div>
       <div className="text-[11px] uppercase tracking-widest text-stone-500">{label}</div>

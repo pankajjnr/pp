@@ -23,7 +23,102 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.pdfgen.canvas import Canvas
+
+
+BUSINESS_NAME = "Pankaj Purwar"
+BUSINESS_TAGLINE = "ACCOUNTS · LEDGER BOOK"
+MUDDAT_CLIENT_NAME = "Muddat"
+
+
+# =========================================================================
+# Shared PDF helpers — one consistent letterhead + footer for all exports.
+# =========================================================================
+
+class _NumberedCanvas(Canvas):
+    """Two-pass canvas — renders footer with "Page X of Y" once total is known."""
+
+    def __init__(self, *args, footer_left: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_pages: list = []
+        self._footer_left = footer_left
+
+    def showPage(self):
+        self._saved_pages.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._saved_pages)
+        for page_state in self._saved_pages:
+            self.__dict__.update(page_state)
+            self._draw_footer(total)
+            super().showPage()
+        super().save()
+
+    def _draw_footer(self, total_pages: int):
+        self.setFont("Helvetica", 8)
+        self.setFillColor(colors.HexColor("#78716C"))
+        self.drawString(18 * mm, 10 * mm, self._footer_left)
+        self.drawRightString(
+            192 * mm, 10 * mm, f"Page {self.getPageNumber()} of {total_pages}"
+        )
+        self.setStrokeColor(colors.HexColor("#E7E5E4"))
+        self.setLineWidth(0.4)
+        self.line(18 * mm, 12 * mm, 192 * mm, 12 * mm)
+
+
+def _pdf_letterhead_flowables(doc_title: str, meta_lines: list[str]) -> list:
+    """Header flowables inserted at the top of the first page (and once at top of story).
+    Reportlab will repeat the on-page letterhead via _draw_letterhead per-page."""
+    styles = getSampleStyleSheet()
+    biz = ParagraphStyle("biz", parent=styles["Title"], fontName="Times-Bold",
+                         fontSize=22, textColor=colors.HexColor("#1C1917"),
+                         alignment=0, leading=24, spaceAfter=1)
+    tag = ParagraphStyle("tag", parent=styles["Normal"], fontName="Helvetica-Bold",
+                         fontSize=8, textColor=colors.HexColor("#B45309"),
+                         alignment=0, leading=10, spaceAfter=4)
+    title = ParagraphStyle("doct", parent=styles["Heading1"], fontName="Times-Bold",
+                           fontSize=18, textColor=colors.HexColor("#1C1917"),
+                           spaceBefore=6, spaceAfter=4)
+    meta = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica",
+                          fontSize=9, textColor=colors.HexColor("#57534E"),
+                          leading=12, spaceAfter=2)
+    flows: list = [
+        Paragraph(BUSINESS_NAME, biz),
+        Paragraph(BUSINESS_TAGLINE, tag),
+        HRFlowable(width="100%", thickness=0.8, color=colors.HexColor("#292524"), spaceBefore=2, spaceAfter=8),
+        Paragraph(doc_title, title),
+    ]
+    for m in meta_lines:
+        flows.append(Paragraph(m, meta))
+    flows.append(Spacer(1, 6))
+    return flows
+
+
+def _pdf_stream(story: list, filename: str) -> StreamingResponse:
+    """Build a PDF with shared margins + numbered footer canvas, return StreamingResponse."""
+    footer_left = (
+        f"Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')} "
+        f"· System-generated document · {BUSINESS_NAME}"
+    )
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=18 * mm, rightMargin=18 * mm,
+        topMargin=18 * mm, bottomMargin=18 * mm,
+        title=BUSINESS_NAME,
+    )
+
+    def canvas_maker(*args, **kwargs):
+        return _NumberedCanvas(*args, footer_left=footer_left, **kwargs)
+
+    doc.build(story, canvasmaker=canvas_maker)
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue()),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ----- Config -----
@@ -436,20 +531,23 @@ async def export_client_ledger(client_id: str, format: str = "csv", _user: dict 
             headers={"Content-Disposition": f'attachment; filename="ledger_{safe_name}.csv"'},
         )
 
-    # PDF — clean, focused on client name
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=22 * mm, rightMargin=22 * mm, topMargin=24 * mm, bottomMargin=20 * mm)
+    # PDF — use shared letterhead + footer helper
     styles = getSampleStyleSheet()
-    # Client name is the dominant focal point — huge, bold
-    name_style = ParagraphStyle("clientname", parent=styles["Title"], fontName="Times-Bold", fontSize=44, textColor=colors.HexColor("#1C1917"), spaceAfter=8, leading=48, alignment=0)
-    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica", fontSize=9, textColor=colors.HexColor("#78716C"), spaceAfter=22)
-    section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, textColor=colors.HexColor("#1C1917"), spaceBefore=14, spaceAfter=8, textTransform="uppercase")
+    name_style = ParagraphStyle("clientname", parent=styles["Title"], fontName="Times-Bold",
+                                fontSize=28, textColor=colors.HexColor("#1C1917"),
+                                spaceAfter=4, leading=32, alignment=0)
+    section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                                   fontSize=11, textColor=colors.HexColor("#1C1917"),
+                                   spaceBefore=14, spaceAfter=8)
 
-    story = []
-    # ↓ removed dense "The Ledger Book" branding block
+    story = _pdf_letterhead_flowables(
+        "Client Statement",
+        [f"<b>Client:</b> {display_name}"],
+    )
     story.append(Paragraph(display_name, name_style))
-    story.append(Paragraph(f"Statement generated {datetime.now(timezone.utc).strftime('%d %b %Y')}", meta_style))
+    story.append(Spacer(1, 6))
 
+    net_color = colors.HexColor("#B45309") if net >= 0 else colors.HexColor("#9F1D1D")
     summary_data = [
         ["Total Payment Received", _fmt_inr(incoming_total)],
         ["Total Payment Given", _fmt_inr(outgoing_total)],
@@ -459,12 +557,16 @@ async def export_client_ledger(client_id: str, format: str = "csv", _user: dict 
     t.setStyle(TableStyle([
         ("FONT", (0, 0), (0, -1), "Helvetica", 10),
         ("FONT", (1, 0), (1, -1), "Helvetica-Bold", 12),
-        ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#065F46")),
-        ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#9A3412")),
-        ("TEXTCOLOR", (1, 2), (1, 2), colors.HexColor("#065F46") if net >= 0 else colors.HexColor("#9A3412")),
-        ("FONT", (1, 2), (1, 2), "Helvetica-Bold", 14),
+        ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#B45309")),
+        ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#9F1D1D")),
+        ("TEXTCOLOR", (1, 2), (1, 2), net_color),
+        ("FONT", (1, 2), (1, 2), "Helvetica-Bold", 16),
+        ("BACKGROUND", (0, 2), (-1, 2), colors.HexColor("#FEF3C7") if net >= 0 else colors.HexColor("#FEE2E2")),
+        ("LINEABOVE", (0, 2), (-1, 2), 0.8, net_color),
+        ("LINEBELOW", (0, 2), (-1, 2), 0.8, net_color),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.3, colors.HexColor("#E7E5E4")),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 0), (-1, 1), 0.3, colors.HexColor("#E7E5E4")),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
     ]))
     story.append(t)
@@ -479,12 +581,14 @@ async def export_client_ledger(client_id: str, format: str = "csv", _user: dict 
             rows.append(["—", "—", "No entries"])
         return rows
 
-    def _table(rows, color):
-        tbl = Table(rows, colWidths=[30 * mm, 40 * mm, 96 * mm])
+    def _table(rows, color, row_tint):
+        tbl = Table(rows, colWidths=[30 * mm, 40 * mm, 96 * mm], repeatRows=1)
         tbl.setStyle(TableStyle([
             ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 9),
             ("FONT", (0, 1), (-1, -1), "Helvetica", 10),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F4F0")),
+            ("BACKGROUND", (0, 1), (-1, -1), row_tint),
             ("TEXTCOLOR", (1, 1), (1, -1), color),
             ("LINEBELOW", (0, 0), (-1, 0), 0.7, colors.HexColor("#78716C")),
             ("LINEBELOW", (0, 1), (-1, -1), 0.2, colors.HexColor("#E7E5E4")),
@@ -495,17 +599,22 @@ async def export_client_ledger(client_id: str, format: str = "csv", _user: dict 
         return tbl
 
     story.append(Paragraph("PAYMENT RECEIVED", section_style))
-    story.append(_table(_rows_for("in"), colors.HexColor("#065F46")))
+    story.append(_table(_rows_for("in"), colors.HexColor("#B45309"), colors.HexColor("#FEFCE8")))
     story.append(Paragraph("PAYMENT GIVEN", section_style))
-    story.append(_table(_rows_for("out"), colors.HexColor("#9A3412")))
+    story.append(_table(_rows_for("out"), colors.HexColor("#9F1D1D"), colors.HexColor("#FEF7F5")))
 
-    doc.build(story)
-    data = buf.getvalue()
-    return StreamingResponse(
-        io.BytesIO(data),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="ledger_{safe_name}.pdf"'},
-    )
+    # Signature block
+    story.append(Spacer(1, 20))
+    sig = Table([["Received by: _______________________", "Date: _______________________"]],
+                colWidths=[85 * mm, 85 * mm])
+    sig.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, -1), "Helvetica", 10),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#57534E")),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(sig)
+
+    return _pdf_stream(story, f"ledger_{safe_name}.pdf")
 
 
 # ----- Payment Routes -----
@@ -766,26 +875,15 @@ async def export_procurement(
     total_cost = sum(float(r.get("total_amount", 0)) for r in rows)
     wavg = (total_cost / total_weight) if total_weight > 0 else 0.0
 
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
-                            topMargin=20 * mm, bottomMargin=18 * mm)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("title", parent=styles["Title"], fontName="Times-Bold",
-                                 fontSize=26, textColor=colors.HexColor("#1C1917"),
-                                 spaceAfter=4, leading=30, alignment=0)
-    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica",
-                                fontSize=9, textColor=colors.HexColor("#78716C"), spaceAfter=14)
     section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold",
                                    fontSize=10, textColor=colors.HexColor("#1C1917"),
                                    spaceBefore=12, spaceAfter=6)
 
-    story = [
-        Paragraph("Procurement Log", title_style),
-        Paragraph(
-            f"Scope: {scope_label} &nbsp;·&nbsp; Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}",
-            meta_style,
-        ),
-    ]
+    story = _pdf_letterhead_flowables(
+        "Procurement Log",
+        [f"<b>Scope:</b> {scope_label}"],
+    )
 
     # Summary block
     summary_rows = [
@@ -835,14 +933,8 @@ async def export_procurement(
     ]))
     story.append(tbl)
 
-    doc.build(story)
-    data_bytes = buf.getvalue()
     filename = f"procurement_{scope_label.replace(' ', '_')}.pdf"
-    return StreamingResponse(
-        io.BytesIO(data_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return _pdf_stream(story, filename)
 
 
 @api_router.get("/procurement/clients/{client_id}/export")
@@ -899,28 +991,19 @@ async def export_client_procurement(
     grand_weight = sum(g["total_weight"] for g in ordered_groups)
     grand_amount = sum(g["total_amount"] for g in ordered_groups)
 
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm,
-                            topMargin=20 * mm, bottomMargin=18 * mm)
     styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("title", parent=styles["Title"], fontName="Times-Bold",
-                                 fontSize=26, textColor=colors.HexColor("#1C1917"),
-                                 spaceAfter=4, leading=30, alignment=0)
-    meta_style = ParagraphStyle("meta", parent=styles["Normal"], fontName="Helvetica",
-                                fontSize=9, textColor=colors.HexColor("#78716C"), spaceAfter=14)
     section_style = ParagraphStyle("section", parent=styles["Heading2"], fontName="Helvetica-Bold",
                                    fontSize=11, textColor=colors.HexColor("#1C1917"),
                                    spaceBefore=14, spaceAfter=6)
 
     product_scope = product_name_filter or "All products"
-    story = [
-        Paragraph(f"Procurement — {_display_client_name(c['name'])}", title_style),
-        Paragraph(
-            f"Range: {from_date} → {to_date} &nbsp;·&nbsp; {product_scope} "
-            f"&nbsp;·&nbsp; Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}",
-            meta_style,
-        ),
-    ]
+    story = _pdf_letterhead_flowables(
+        f"Client Subledger — {_display_client_name(c['name'])}",
+        [
+            f"<b>Range:</b> {from_date} &rarr; {to_date}",
+            f"<b>Products:</b> {product_scope}",
+        ],
+    )
 
     # Summary
     summary_rows = [
@@ -957,7 +1040,6 @@ async def export_client_procurement(
                     _fmt_inr(float(r.get("rate", 0))),
                     _fmt_inr(float(r.get("total_amount", 0))),
                 ])
-            # subtotal row
             data.append([
                 "Subtotal",
                 f"{g['total_weight']:,.2f}",
@@ -983,33 +1065,37 @@ async def export_client_procurement(
             ]))
             story.append(tbl)
 
-        # Grand total footer table
         story.append(Paragraph("GRAND TOTAL", section_style))
         gt = Table([[
             f"Total Weight: {grand_weight:,.2f} Qtl",
             f"Grand Total: {_fmt_inr(grand_amount)}",
         ]], colWidths=[80 * mm, 80 * mm])
         gt.setStyle(TableStyle([
-            ("FONT", (0, 0), (-1, -1), "Helvetica-Bold", 11),
+            ("FONT", (0, 0), (-1, -1), "Helvetica-Bold", 12),
             ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#1C1917")),
-            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F4F0")),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FEF3C7")),  # amber accent
             ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("LINEABOVE", (0, 0), (-1, -1), 0.6, colors.HexColor("#78716C")),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.6, colors.HexColor("#78716C")),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("LINEABOVE", (0, 0), (-1, -1), 1.0, colors.HexColor("#B45309")),
+            ("LINEBELOW", (0, 0), (-1, -1), 1.0, colors.HexColor("#B45309")),
         ]))
         story.append(gt)
 
-    doc.build(story)
-    data_bytes = buf.getvalue()
+        # Signature line
+        story.append(Spacer(1, 20))
+        sig = Table([["Received by: _______________________", "Date: _______________________"]],
+                    colWidths=[85 * mm, 85 * mm])
+        sig.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, -1), "Helvetica", 10),
+            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#57534E")),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(sig)
+
     safe_client = "".join(ch for ch in c["name"] if ch.isalnum() or ch in "-_") or "client"
     filename = f"procurement_{safe_client}_{from_date}_{to_date}.pdf"
-    return StreamingResponse(
-        io.BytesIO(data_bytes),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    return _pdf_stream(story, filename)
 
 
 DEFAULT_PRODUCTS = ["Maize", "Wheat", "Bajra"]
@@ -1056,6 +1142,7 @@ class SettlementOut(BaseModel):
     deduction_amount: float
     net_paid: float
     linked_payment_id: Optional[str] = None
+    muddat_payment_id: Optional[str] = None
     created_at: str
 
 
@@ -1216,9 +1303,13 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
 
     settlement_id = str(uuid.uuid4())
     payment_id = str(uuid.uuid4())
+    muddat_payment_id = str(uuid.uuid4())
     entry_ids = [r["id"] for r in rows]
     today_iso = today_local_date().isoformat()
     created_ts = now_iso()
+
+    # Ensure Muddat system account exists (idempotent)
+    muddat_client_id = await seed_muddat_account()
 
     payment_doc = {
         "id": payment_id,
@@ -1232,8 +1323,25 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
         ),
         "entry_date": today_iso,
         "created_at": created_ts,
-        "settlement_id": settlement_id,  # extra field; ignored by PaymentOut model
+        "settlement_id": settlement_id,
     }
+
+    muddat_payment_doc = None
+    if deduction > 0:
+        muddat_payment_doc = {
+            "id": muddat_payment_id,
+            "client_id": muddat_client_id,
+            "client_name": MUDDAT_CLIENT_NAME,
+            "direction": "in",
+            "amount": deduction,
+            "description": (
+                f"Deduction from {c['name']} settlement — material dated "
+                f"{payload.from_date} to {payload.to_date} ({ded_pct}%)"
+            ),
+            "entry_date": today_iso,
+            "created_at": created_ts,
+            "settlement_id": settlement_id,
+        }
 
     settlement_doc = {
         "id": settlement_id,
@@ -1247,21 +1355,20 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
         "deduction_amount": deduction,
         "net_paid": net,
         "linked_payment_id": payment_id,
+        "muddat_payment_id": muddat_payment_id if muddat_payment_doc else None,
         "entry_ids": entry_ids,
         "created_at": created_ts,
     }
 
-    # Best-effort "atomic" sequence — rollback on any failure to avoid
-    # ending up with entries flagged settled but no ledger payment / settlement record.
     flagged = False
     payment_inserted = False
+    muddat_inserted = False
     settlement_inserted = False
     try:
         upd = await db.procurement_entries.update_many(
             {"id": {"$in": entry_ids}, "is_settled": {"$ne": True}},
             {"$set": {"is_settled": True, "settlement_id": settlement_id}},
         )
-        # Guard: race — someone else settled in between. Roll back everything.
         if upd.modified_count != len(entry_ids):
             raise RuntimeError("Entry count mismatch — concurrent settlement suspected")
         flagged = True
@@ -1269,12 +1376,17 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
         await db.payments.insert_one(payment_doc)
         payment_inserted = True
 
+        if muddat_payment_doc is not None:
+            await db.payments.insert_one(muddat_payment_doc)
+            muddat_inserted = True
+
         await db.procurement_settlements.insert_one(settlement_doc)
         settlement_inserted = True
     except Exception as exc:
-        # Reverse in the opposite order.
         if settlement_inserted:
             await db.procurement_settlements.delete_one({"id": settlement_id})
+        if muddat_inserted:
+            await db.payments.delete_one({"id": muddat_payment_id})
         if payment_inserted:
             await db.payments.delete_one({"id": payment_id})
         if flagged:
@@ -1299,6 +1411,7 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
         deduction_amount=deduction,
         net_paid=net,
         linked_payment_id=payment_id,
+        muddat_payment_id=muddat_payment_id if muddat_payment_doc else None,
         created_at=created_ts,
     )
 
@@ -1320,6 +1433,7 @@ async def list_settlements(
             entry_count=r["entry_count"], gross_amount=r["gross_amount"],
             deduction_percent=r["deduction_percent"], deduction_amount=r["deduction_amount"],
             net_paid=r["net_paid"], linked_payment_id=r.get("linked_payment_id"),
+            muddat_payment_id=r.get("muddat_payment_id"),
             created_at=r["created_at"],
         ))
     return out
@@ -1338,6 +1452,7 @@ async def get_settlement(settlement_id: str, _user: dict = Depends(get_current_u
         entry_count=r["entry_count"], gross_amount=r["gross_amount"],
         deduction_percent=r["deduction_percent"], deduction_amount=r["deduction_amount"],
         net_paid=r["net_paid"], linked_payment_id=r.get("linked_payment_id"),
+        muddat_payment_id=r.get("muddat_payment_id"),
         created_at=r["created_at"],
         entries=_to_entry_refs(entries),
         subtotals=_compute_subtotals(entries),
@@ -1353,6 +1468,25 @@ async def seed_products():
                 "name_lower": name.lower(),
                 "created_at": now_iso(),
             })
+
+
+async def seed_muddat_account() -> str:
+    """Special system client that accumulates settlement deductions.
+    Idempotent — creates only if missing, returns the client id either way."""
+    existing = await db.clients.find_one(
+        {"name_lower": MUDDAT_CLIENT_NAME.lower()}, {"_id": 0, "id": 1}
+    )
+    if existing:
+        return existing["id"]
+    doc = {
+        "id": str(uuid.uuid4()),
+        "name": MUDDAT_CLIENT_NAME,
+        "name_lower": MUDDAT_CLIENT_NAME.lower(),
+        "note": "System account — accumulated settlement deductions",
+        "created_at": now_iso(),
+    }
+    await db.clients.insert_one(doc)
+    return doc["id"]
 
 
 # ----- Health / Root -----
@@ -1410,6 +1544,7 @@ async def on_startup():
         )
     await seed_admin()
     await seed_products()
+    await seed_muddat_account()
 
 
 @app.on_event("shutdown")
