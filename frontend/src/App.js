@@ -14,6 +14,7 @@ import ProcurementLog from "@/pages/ProcurementLog";
 import ClientSubledger from "@/pages/ClientSubledger";
 import ProductLedger from "@/pages/ProductLedger";
 import ProcurementSettlement from "@/pages/ProcurementSettlement";
+import BackupRestore from "@/pages/BackupRestore";
 function App() {
   return (
     <div className="App">
@@ -33,6 +34,7 @@ function App() {
                 <Route path="procurement/client-subledger" element={<ClientSubledger />} />
                 <Route path="procurement/product-ledger" element={<ProductLedger />} />
                 <Route path="procurement/settlement" element={<ProcurementSettlement />} />
+                <Route path="admin/backup" element={<BackupRestore />} />
               </Route>
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

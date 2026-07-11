@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 
@@ -34,6 +34,9 @@ export default function Layout() {
     { to: "/procurement/product-ledger", label: t("nav.productLedger"), icon: Wheat, testid: "nav-product-ledger" },
     { to: "/procurement/settlement", label: t("nav.settlement"), icon: Wallet, testid: "nav-settlement" },
   ];
+  if (user?.role === "admin") {
+    navItems.push({ to: "/admin/backup", label: "Backup", icon: Shield, testid: "nav-backup" });
+  }
 
   const handleLogout = async () => {
     await logout();

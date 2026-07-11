@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, X as XIcon } from "lucide-react";
+import { Link } from "react-router-dom";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Calendar } from "@/components/ui/calendar";
 import { toast } from "sonner";
 import { useLang } from "@/context/LangContext";
+import { useAuth } from "@/context/AuthContext";
 import StatCard from "@/components/StatCard";
 import usePageTitle from "@/hooks/usePageTitle";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
@@ -190,6 +192,27 @@ export default function Dashboard() {
   const [muddatBalance, setMuddatBalance] = useState(0);
   const [recentActivity, setRecentActivity] = useState([]);
 
+  // Backup reminder banner (session-scoped dismiss)
+  const { user } = useAuth();
+  const isAdmin = user?.role === "admin";
+  const [backupStatus, setBackupStatus] = useState(null);
+  const [bannerDismissed, setBannerDismissed] = useState(false);
+  useEffect(() => {
+    if (!isAdmin) return;
+    api.get("/admin/backup/status")
+      .then((r) => setBackupStatus(r.data))
+      .catch(() => {});
+    // dismiss flag lives only in memory (window.name isn't reset across tabs;
+    // per session we keep it on window itself)
+    if (window.__backup_banner_dismissed_at) {
+      setBannerDismissed(true);
+    }
+  }, [isAdmin]);
+  const dismissBanner = () => {
+    window.__backup_banner_dismissed_at = Date.now();
+    setBannerDismissed(true);
+  };
+
   const today = new Date();
   today.setHours(23, 59, 59, 999);
 
@@ -263,6 +286,31 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6" data-testid="dashboard-page">
+      {/* Backup reminder — calm, dismissible for session */}
+      {isAdmin && backupStatus?.is_overdue && !bannerDismissed && (
+        <div className="bg-[#FEF3C7] border border-[#B45309] p-4 flex items-start gap-3" data-testid="backup-reminder-banner">
+          <Shield strokeWidth={1.5} className="w-5 h-5 text-[#B45309] mt-0.5 flex-shrink-0" />
+          <div className="flex-1 text-sm text-[#78350F]">
+            <div className="font-medium">
+              {backupStatus.last_backup_at
+                ? `It's been ${backupStatus.days_since_last_backup} days since your last backup.`
+                : "You haven't taken a backup yet."}
+            </div>
+            <div className="text-xs text-[#92400E] mt-0.5">
+              A backup is a copy of every entry, safe outside this app. Threshold: {backupStatus.reminder_threshold_days} days.
+            </div>
+          </div>
+          <Link to="/admin/backup" data-testid="backup-banner-cta"
+            className="bg-[#B45309] text-[#FAFAF9] px-4 py-2 text-xs uppercase tracking-widest hover:bg-[#92400E]">
+            Download Backup Now
+          </Link>
+          <button onClick={dismissBanner} data-testid="backup-banner-dismiss"
+            className="text-[#78350F] hover:text-[#1C1917] p-1" aria-label="Dismiss">
+            <XIcon strokeWidth={1.5} className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Page eyebrow + title (Edit 7) */}
       <header className="border-b border-[#E7E5E4] pb-4">
         <div className="text-xs uppercase tracking-widest text-stone-500">{t("dashboard.eyebrow")}</div>

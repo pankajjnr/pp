@@ -12,13 +12,16 @@ import jwt
 from datetime import datetime, timezone, date, timedelta
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import io
 import csv
+import json
+import zipfile
+from bson import ObjectId
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -1487,6 +1490,190 @@ async def seed_muddat_account() -> str:
     }
     await db.clients.insert_one(doc)
     return doc["id"]
+
+
+# =========================================================================
+# BACKUP · RESTORE · REMINDER
+# =========================================================================
+
+BACKUP_REMINDER_DAYS = int(os.environ.get("BACKUP_REMINDER_DAYS", "7"))
+BACKUP_COLLECTIONS = [
+    "master_products",
+    "clients",
+    "procurement_entries",
+    "payments",
+    "procurement_settlements",
+    "users",
+]
+
+
+def _require_admin(user: dict) -> None:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+
+
+def _jsonable(value):
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+async def _touch_backup_meta():
+    await db.system_settings.update_one(
+        {"key": "backup_meta"},
+        {"$set": {"key": "backup_meta", "last_backup_at": now_iso()}},
+        upsert=True,
+    )
+
+
+@api_router.get("/admin/backup/status")
+async def backup_status(user: dict = Depends(get_current_user)):
+    _require_admin(user)
+    rec = await db.system_settings.find_one({"key": "backup_meta"}, {"_id": 0})
+    last = rec.get("last_backup_at") if rec else None
+    days = None
+    overdue = True
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            days = (datetime.now(timezone.utc) - last_dt).days
+            overdue = days >= BACKUP_REMINDER_DAYS
+        except ValueError:
+            pass
+    return {
+        "last_backup_at": last,
+        "days_since_last_backup": days,
+        "is_overdue": overdue,
+        "reminder_threshold_days": BACKUP_REMINDER_DAYS,
+    }
+
+
+@api_router.get("/admin/backup/export")
+async def backup_export(user: dict = Depends(get_current_user)):
+    _require_admin(user)
+    stamp = datetime.now(timezone.utc)
+    manifest = {
+        "generated_at": stamp.isoformat(),
+        "app": BUSINESS_NAME,
+        "schema_version": 1,
+        "collections": {},
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for coll in BACKUP_COLLECTIONS:
+            docs = await db[coll].find({}, {"_id": 0}).to_list(100000)
+            clean = [_jsonable(d) for d in docs]
+            zf.writestr(
+                f"{coll}.json",
+                json.dumps(clean, ensure_ascii=False, indent=2, default=str),
+            )
+            manifest["collections"][coll] = len(clean)
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+    await _touch_backup_meta()
+
+    filename = f"backup_{stamp.strftime('%Y-%m-%d_%H%M')}.zip"
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue()),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@api_router.post("/admin/backup/restore")
+async def backup_restore(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    _require_admin(user)
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(payload))
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+
+    names = set(zf.namelist())
+    if "manifest.json" not in names:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing manifest.json — this doesn't look like a backup produced by this app.",
+        )
+
+    try:
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Corrupt manifest.json: {exc}")
+
+    expected = manifest.get("collections") or {}
+    if not isinstance(expected, dict) or not expected:
+        raise HTTPException(status_code=400, detail="Manifest lists no collections.")
+    for coll in expected.keys():
+        if f"{coll}.json" not in names:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing {coll}.json — backup file is incomplete.",
+            )
+
+    # Restore in dependency-sensible order (masters first, then transactions)
+    order = [c for c in BACKUP_COLLECTIONS if c in expected]
+    for c in expected.keys():
+        if c not in order:
+            order.append(c)
+
+    summary: dict = {}
+    for coll in order:
+        try:
+            docs = json.loads(zf.read(f"{coll}.json").decode("utf-8"))
+        except Exception as exc:
+            summary[coll] = {"inserted": 0, "updated": 0, "failed": 0, "error": str(exc)}
+            continue
+        if not isinstance(docs, list):
+            summary[coll] = {"inserted": 0, "updated": 0, "failed": 0, "error": "not a list"}
+            continue
+
+        inserted = 0
+        updated = 0
+        failed: list = []
+        for doc in docs:
+            doc_id = doc.get("id")
+            if not doc_id:
+                failed.append({"reason": "no `id` field", "doc": doc})
+                continue
+            try:
+                existing = await db[coll].find_one({"id": doc_id}, {"_id": 1})
+                await db[coll].replace_one({"id": doc_id}, doc, upsert=True)
+                if existing:
+                    updated += 1
+                else:
+                    inserted += 1
+            except Exception as exc:
+                failed.append({"id": doc_id, "reason": str(exc)})
+
+        summary[coll] = {
+            "expected": expected.get(coll),
+            "inserted": inserted,
+            "updated": updated,
+            "failed": len(failed),
+            "failures": failed[:20],  # cap for response size
+        }
+
+    return {
+        "ok": True,
+        "manifest": {
+            "generated_at": manifest.get("generated_at"),
+            "app": manifest.get("app"),
+        },
+        "summary": summary,
+    }
 
 
 # ----- Health / Root -----
