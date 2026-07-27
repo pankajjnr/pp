@@ -16,6 +16,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Respons
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import certifi
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import io
 import csv
@@ -131,7 +132,7 @@ MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(mongo_url, tlsCAFile=certifi.where())
 db = client[os.environ['DB_NAME']]
 
 app = FastAPI(title="Ledger Book API")
