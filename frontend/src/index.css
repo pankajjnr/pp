@@ -1,0 +1,177 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Work+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+Devanagari:wght@400;500;600;700&family=Poppins:wght@400;500;600;700&display=swap");
+
+body {
+    margin: 0;
+    font-family: "Work Sans", "Noto Sans Devanagari", "Poppins", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #f9f8f6;
+    color: #1c1917;
+    font-feature-settings: "kern", "liga";
+}
+
+/* Devanagari: use Noto Sans Devanagari with generous line-height to avoid clipping */
+html[lang="hi"] body,
+html[lang="hi"] .font-serif {
+    font-family: "Noto Sans Devanagari", "Poppins", "Work Sans", sans-serif;
+    line-height: 1.55;
+}
+html[lang="hi"] h1,
+html[lang="hi"] h2,
+html[lang="hi"] h3 {
+    line-height: 1.35;
+    letter-spacing: 0;
+}
+
+.font-serif {
+    font-family: "Cormorant Garamond", ui-serif, Georgia, serif;
+}
+
+.font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.paper-grain {
+    background-image:
+        radial-gradient(
+            circle at 25% 25%,
+            rgba(28, 25, 23, 0.02) 1px,
+            transparent 1px
+        ),
+        radial-gradient(
+            circle at 75% 75%,
+            rgba(28, 25, 23, 0.015) 1px,
+            transparent 1px
+        );
+    background-size:
+        12px 12px,
+        20px 20px;
+}
+
+.ledger-line {
+    background-image: linear-gradient(
+        to bottom,
+        transparent 0,
+        transparent calc(2rem - 1px),
+        rgba(214, 211, 209, 0.4) calc(2rem - 1px),
+        rgba(214, 211, 209, 0.4) 2rem
+    );
+    background-size: 100% 2rem;
+}
+
+/* Calendar day badges (admin only) */
+.cal-day-in {
+    position: relative;
+    font-weight: 600;
+}
+.cal-day-in::after {
+    content: "";
+    position: absolute;
+    bottom: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background-color: #059669; /* emerald-600 */
+}
+.cal-day-out {
+    position: relative;
+    font-weight: 600;
+}
+.cal-day-out::after {
+    content: "";
+    position: absolute;
+    bottom: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background-color: #ea580c; /* orange-600 */
+}
+.cal-day-both {
+    position: relative;
+    font-weight: 700;
+}
+.cal-day-both::after {
+    content: "";
+    position: absolute;
+    bottom: 3px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: linear-gradient(90deg, #059669 50%, #ea580c 50%);
+}
+
+/* Micro-interactions */
+button, a {
+    transition: transform 0.15s ease, background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+button:active {
+    transform: scale(0.97);
+}
+.hover-lift:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px -8px rgba(28, 25, 23, 0.18);
+}
+
+/* Focused column glow */
+.col-focus-in {
+    box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.35), 0 8px 24px -12px rgba(5, 150, 105, 0.4);
+}
+.col-focus-out {
+    box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.35), 0 8px 24px -12px rgba(234, 88, 12, 0.4);
+}
+
+/* Skeleton */
+@keyframes skeleton-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 0.85; }
+}
+.skeleton-row {
+    height: 14px;
+    background: linear-gradient(90deg, #E7E5E4 0%, #F5F5F4 50%, #E7E5E4 100%);
+    animation: skeleton-pulse 1.4s ease-in-out infinite;
+    border-radius: 2px;
+}
+
+@layer base {
+    :root {
+        --background: 40 33% 97%;
+        --foreground: 24 10% 10%;
+        --card: 0 0% 100%;
+        --card-foreground: 24 10% 10%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 24 10% 10%;
+        --primary: 24 10% 15%;
+        --primary-foreground: 40 33% 97%;
+        --secondary: 40 20% 94%;
+        --secondary-foreground: 24 10% 15%;
+        --muted: 40 20% 94%;
+        --muted-foreground: 24 6% 40%;
+        --accent: 40 20% 94%;
+        --accent-foreground: 24 10% 15%;
+        --destructive: 0 62% 45%;
+        --destructive-foreground: 40 33% 97%;
+        --border: 30 10% 88%;
+        --input: 30 10% 88%;
+        --ring: 24 10% 40%;
+        --radius: 0.125rem;
+    }
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+    body {
+        @apply bg-background text-foreground;
+    }
+}

@@ -1,0 +1,29 @@
+{
+  "summary": "BLOCKER: Dashboard.jsx fails to compile due to a duplicated/stray closing JSX block after the component's return + closing brace. App shows CRA 'Compiled with problems' overlay on /login and no functional UI is reachable, so none of the regression flows (login, dashboard reload, dialogs, calculate, clients, client detail, search, logout) could be exercised.",
+  "tested_scope": ["frontend"],
+  "passed": [
+    "Public URL reachable — served CRA dev server overlay",
+    "Initial /login navigation produced 0 network 401s and 0 console errors before the compile overlay was displayed (basic AuthContext short-circuit appears to hold when bundle actually parses)"
+  ],
+  "failed": [
+    {
+      "area": "frontend build / Dashboard.jsx",
+      "issue": "SyntaxError: Unexpected token at Dashboard.jsx line 346:7. After the component function closes at line 345 ('}'), lines 346-350 contain stray JSX (</DialogFooter></DialogContent></Dialog></div>);) that is duplicated leftover markup from the calc-result dialog. Build fails, entire app cannot render.",
+      "evidence": "CRA overlay: 'ERROR in ./src/pages/Dashboard.jsx — Module build failed ... SyntaxError: /app/frontend/src/pages/Dashboard.jsx: Unexpected token (346:7)'. Confirmed by viewing file lines 320-352 — function body ends at line 344 ');' and 345 '}' then extraneous JSX begins at 346.",
+      "priority": "HIGH"
+    },
+    {
+      "area": "regression coverage",
+      "issue": "Unable to verify any of the requested regressions (401 on load, Radix DialogDescription warnings across Add Payment / Calculate confirm+result / Add Client / per-client Calculate modals, calendar toggle, search 'ravi', language toggle, logout) because the app never mounts.",
+      "evidence": "Playwright could not locate input[type='email'] on /login — overlay covered the page.",
+      "priority": "HIGH"
+    }
+  ],
+  "action_items": [
+    "Delete the stray lines 346-350 in /app/frontend/src/pages/Dashboard.jsx (the trailing '</DialogFooter></DialogContent></Dialog></div>);' block that appears AFTER the component's final '}' on line 345). File should end at line 345 with the closing '}' of the Dashboard function (plus a trailing newline).",
+    "After fix, reload /login and confirm CRA overlay is gone; then re-run the console-error + Radix DialogDescription regression sweep."
+  ],
+  "success_rate": {"backend": "not tested", "frontend": "0% (build broken)"},
+  "retest_needed": true,
+  "full_testing_deferred": true
+}
