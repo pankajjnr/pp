@@ -404,9 +404,27 @@ async def create_client(payload: ClientCreate, _user: dict = Depends(get_current
 @api_router.get("/clients", response_model=List[ClientOut])
 async def list_clients(_user: dict = Depends(get_current_user)):
     clients = await db.clients.find({}, {"_id": 0}).sort("name_lower", 1).to_list(2000)
+
+    # Single aggregate over all payments, grouped by client + direction, instead
+    # of one aggregate query per client (which was N+1 and slowed this page down
+    # more as clients were added). Totals per client are identical to before —
+    # just computed in one round trip instead of many.
+    pipeline = [
+        {"$group": {"_id": {"client_id": "$client_id", "direction": "$direction"}, "total": {"$sum": "$amount"}}},
+    ]
+    agg = await db.payments.aggregate(pipeline).to_list(20000)
+    totals: dict = {}
+    for row in agg:
+        cid = row["_id"]["client_id"]
+        bucket = totals.setdefault(cid, {"in": 0.0, "out": 0.0})
+        direction = row["_id"]["direction"]
+        if direction in ("in", "out"):
+            bucket[direction] = float(row["total"])
+
     result: List[ClientOut] = []
     for c in clients:
-        incoming, outgoing = await _compute_client_totals(c["id"])
+        t = totals.get(c["id"], {"in": 0.0, "out": 0.0})
+        incoming, outgoing = t["in"], t["out"]
         result.append(ClientOut(
             id=c["id"], name=c["name"], note=c.get("note"),
             created_at=c["created_at"],
