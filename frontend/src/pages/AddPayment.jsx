@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { cn } from "@/lib/utils";
+import { cn, formatIndianNumber, sanitizeAmountInput, amountToWordsIndian } from "@/lib/utils";
 
 export default function AddPayment() {
   const navigate = useNavigate();
@@ -145,13 +145,18 @@ export default function AddPayment() {
           <div className="mt-2 flex items-baseline gap-3 border-b border-[#D6D3D1]">
             <span className="font-mono text-3xl text-stone-500">₹</span>
             <input
-              type="number" step="0.01" min="0" value={amount}
-              onChange={(e) => setAmount(e.target.value)}
+              type="text" inputMode="decimal" value={formatIndianNumber(amount)}
+              onChange={(e) => setAmount(sanitizeAmountInput(e.target.value))}
               required data-testid="amount-input"
               placeholder="0"
               className="flex-1 bg-transparent py-2 font-mono text-3xl focus:outline-none placeholder-stone-300"
             />
           </div>
+          {amount && Number(amount) > 0 && (
+            <p className="mt-1.5 text-xs text-stone-500 italic" data-testid="amount-in-words">
+              {amountToWordsIndian(amount)}
+            </p>
+          )}
         </div>
 
         {/* Date */}
@@ -209,6 +214,9 @@ export default function AddPayment() {
               <div className="text-xs uppercase tracking-widest">Amount</div>
               <div className="font-mono text-5xl mt-2" data-testid="confirm-amount">
                 {isIn ? "+" : "−"}{formatCurrency(amount)}
+              </div>
+              <div className="text-xs text-stone-500 italic mt-1.5" data-testid="confirm-amount-words">
+                {amountToWordsIndian(amount)}
               </div>
             </div>
             <p className="text-xs text-stone-500 text-center italic">Once confirmed, this entry cannot be altered.</p>
