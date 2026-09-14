@@ -43,12 +43,12 @@ export function formatCurrency(amount) {
   return "₹" + n.toLocaleString("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 0 });
 }
 
-// Salutation: "Ramesh" → "Shree Ramesh Ji" (display-only; store raw in DB)
+// Salutation: "Ramesh" → "Ramesh Ji" (display-only; store raw in DB)
 export function formatClientName(raw) {
   if (!raw) return "";
   const trimmed = String(raw).trim();
   if (!trimmed) return "";
-  return `Shree ${trimmed} Ji`;
+  return `${trimmed} Ji`;
 }
 
 export function formatDate(iso) {
