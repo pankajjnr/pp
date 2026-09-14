@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 import {
@@ -17,12 +17,22 @@ function LiveClock({ lang }) {
     return () => clearInterval(id);
   }, []);
   const locale = lang === "hi" ? "hi-IN" : "en-IN";
-  const dateStr = now.toLocaleDateString(locale, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+  const dateStr = now.toLocaleDateString(locale, { weekday: "short", day: "numeric", month: "short" });
   const timeStr = now.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true });
   return (
-    <div className="flex flex-col items-end leading-tight" data-testid="live-clock">
-      <span className="font-mono text-sm text-[#1C1917] tabular-nums" data-testid="clock-time">{timeStr}</span>
-      <span className="text-[10px] uppercase tracking-widest text-stone-500" data-testid="clock-date">{dateStr}</span>
+    <div
+      className="hidden sm:flex items-center gap-2.5 px-3 py-1.5 border border-[#D6D3D1] bg-white/60"
+      data-testid="live-clock"
+    >
+      <Clock strokeWidth={1.5} className="w-4 h-4 text-stone-400 shrink-0" />
+      <div className="flex flex-col leading-tight">
+        <span className="font-mono text-sm font-semibold text-[#1C1917] tabular-nums" data-testid="clock-time">
+          {timeStr}
+        </span>
+        <span className="text-[10px] uppercase tracking-widest text-stone-500" data-testid="clock-date">
+          {dateStr}
+        </span>
+      </div>
     </div>
   );
 }
