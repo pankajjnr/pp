@@ -507,7 +507,7 @@ def _fmt_inr(n: float) -> str:
 def _display_client_name(raw: str) -> str:
     if not raw:
         return raw
-    return f"Shree {raw} Ji"
+    return f"{raw} Ji"
 
 
 @api_router.get("/clients/{client_id}/export")
