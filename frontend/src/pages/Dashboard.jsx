@@ -11,7 +11,7 @@ import usePageTitle from "@/hooks/usePageTitle";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
-import { cn } from "@/lib/utils";
+import { cn, formatIndianNumber, sanitizeAmountInput, amountToWordsIndian } from "@/lib/utils";
 
 function toIsoDate(d) {
   const y = d.getFullYear();
@@ -118,10 +118,16 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
               <label className="text-xs uppercase tracking-widest text-stone-500">{t("add.amount")}</label>
               <div className="mt-2 flex items-baseline gap-2 border-b border-[#D6D3D1]">
                 <span className="font-mono text-2xl text-stone-500">₹</span>
-                <input type="number" step="0.01" min="0" value={amount} onChange={(e) => setAmount(e.target.value)}
+                <input type="text" inputMode="decimal" value={formatIndianNumber(amount)}
+                  onChange={(e) => setAmount(sanitizeAmountInput(e.target.value))}
                   required data-testid="amount-input" placeholder="0"
                   className="flex-1 bg-transparent py-2 font-mono text-2xl focus:outline-none placeholder-stone-300 w-0" />
               </div>
+              {amount && Number(amount) > 0 && (
+                <p className="mt-1.5 text-xs text-stone-500 italic" data-testid="amount-in-words">
+                  {amountToWordsIndian(amount)}
+                </p>
+              )}
             </div>
             <div>
               <label className="text-xs uppercase tracking-widest text-stone-500">{t("add.date")}</label>
