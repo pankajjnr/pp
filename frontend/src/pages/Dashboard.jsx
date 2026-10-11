@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, X as XIcon } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, Pencil, Trash2, X as XIcon } from "lucide-react";
 import { Link } from "react-router-dom";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Calendar } from "@/components/ui/calendar";
@@ -20,7 +20,7 @@ function toIsoDate(d) {
   return `${y}-${m}-${dd}`;
 }
 
-function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
+function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate, editing = null }) {
   const { t, lang } = useLang();
   const serif = lang === "hi" ? "" : "font-serif";
   const [clients, setClients] = useState([]);
@@ -34,14 +34,23 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
 
   useEffect(() => {
     if (open) {
-      setEntryDate(defaultDate);
+      if (editing) {
+        setSelectedId(editing.client_id);
+        setDirection(editing.direction);
+        setAmount(String(editing.amount));
+        setDescription(editing.description || "");
+        setEntryDate(editing.entry_date);
+      } else {
+        setEntryDate(defaultDate);
+      }
       api.get("/clients").then((r) => setClients(r.data)).catch(() => {});
     } else {
       setSelectedId(""); setAmount(""); setDescription(""); setDirection("out");
     }
-  }, [open, defaultDate]);
+  }, [open, defaultDate, editing]);
 
-  const selectedClient = clients.find((c) => c.id === selectedId);
+  const selectedClient = clients.find((c) => c.id === selectedId)
+    || (editing && selectedId === editing.client_id ? { name: editing.client_name } : undefined);
   const isIn = direction === "in";
 
   const submit = async (e) => {
@@ -50,11 +59,18 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
     if (!amount || Number(amount) <= 0) return toast.error(t("add.amountPositive"));
     setSaving(true);
     try {
-      await api.post("/payments", {
-        client_id: selectedId, direction, amount: Number(amount),
-        description, entry_date: entryDate,
-      });
-      toast.success(t("add.savedToast"));
+      if (editing) {
+        await api.put(`/payments/${editing.id}`, {
+          direction, amount: Number(amount), description, entry_date: entryDate,
+        });
+        toast.success("Payment updated");
+      } else {
+        await api.post("/payments", {
+          client_id: selectedId, direction, amount: Number(amount),
+          description, entry_date: entryDate,
+        });
+        toast.success(t("add.savedToast"));
+      }
       onSaved && onSaved();
       onOpenChange(false);
     } catch (err) { toast.error(formatApiError(err)); }
@@ -64,7 +80,7 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm max-w-lg" data-testid="add-payment-modal">
-        <DialogHeader><DialogTitle className={`text-2xl ${serif}`}>{t("add.modalTitle")}</DialogTitle>
+        <DialogHeader><DialogTitle className={`text-2xl ${serif}`}>{editing ? "Edit payment" : t("add.modalTitle")}</DialogTitle>
           <DialogDescription className="sr-only">Add a new payment entry</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-5" data-testid="add-payment-form">
@@ -72,8 +88,8 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
             <label className="text-xs uppercase tracking-widest text-stone-500">{t("add.client")}</label>
             <Popover open={popOpen} onOpenChange={setPopOpen}>
               <PopoverTrigger asChild>
-                <button type="button" data-testid="client-select-trigger"
-                  className="mt-2 w-full flex justify-between items-center bg-transparent border-b border-[#D6D3D1] py-2 text-lg focus:outline-none focus:border-[#292524]">
+                <button type="button" data-testid="client-select-trigger" disabled={!!editing}
+                  className="mt-2 disabled:opacity-60 disabled:cursor-not-allowed w-full flex justify-between items-center bg-transparent border-b border-[#D6D3D1] py-2 text-lg focus:outline-none focus:border-[#292524]">
                   <span className={cn(!selectedClient && "text-stone-400")}>{selectedClient ? formatClientName(selectedClient.name) : t("add.clientPlaceholder")}</span>
                   <ChevronsUpDown strokeWidth={1.5} className="w-4 h-4 text-stone-500" />
                 </button>
@@ -157,7 +173,7 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate }) {
   );
 }
 
-function PaymentColumn({ items, emptyMsg, tone, testid }) {
+function PaymentColumn({ items, emptyMsg, tone, testid, onEdit, onDelete }) {
   const color = tone === "in" ? "text-emerald-800" : "text-orange-800";
   return (
     <div data-testid={testid}>
@@ -171,7 +187,25 @@ function PaymentColumn({ items, emptyMsg, tone, testid }) {
                 <div className="font-medium text-[#1C1917] truncate text-sm">{formatClientName(p.client_name)}</div>
                 {p.description && <div className="text-xs text-stone-500 truncate">{p.description}</div>}
               </div>
-              <div className={`font-mono text-base ${color} whitespace-nowrap`}>{formatCurrency(p.amount)}</div>
+              <div className="flex items-center gap-3 shrink-0">
+                <div className={`font-mono text-base ${color} whitespace-nowrap`}>{formatCurrency(p.amount)}</div>
+                {p.settlement_id ? (
+                  <span className="text-[10px] uppercase tracking-widest text-stone-400" title="Created by a settlement — undo the settlement to change it">
+                    Settlement
+                  </span>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => onEdit(p)} title="Edit" data-testid={`payment-edit-${p.id}`}
+                      className="text-stone-400 hover:text-[#292524]">
+                      <Pencil strokeWidth={1.5} className="w-4 h-4" />
+                    </button>
+                    <button type="button" onClick={() => onDelete(p)} title="Delete" data-testid={`payment-delete-${p.id}`}
+                      className="text-stone-400 hover:text-red-700">
+                      <Trash2 strokeWidth={1.5} className="w-4 h-4" />
+                    </button>
+                  </>
+                )}
+              </div>
             </li>
           ))}
         </ul>
@@ -196,6 +230,7 @@ export default function Dashboard() {
   // Dashboard-level stats (Edit 1 + Edit 7)
   const [todayProcurement, setTodayProcurement] = useState({ count: 0, weight: 0, cost: 0 });
   const [recentActivity, setRecentActivity] = useState([]);
+  const [editingPayment, setEditingPayment] = useState(null);
 
   // Backup reminder banner (session-scoped dismiss)
   const { user } = useAuth();
@@ -235,28 +270,51 @@ export default function Dashboard() {
 
   useEffect(() => { fetchPayments(); }, [activeDateStr]);
 
-  // Load Dashboard-level stats + recent activity (once)
-  useEffect(() => {
+  // Load Dashboard-level stats + recent activity (procurement AND payments of today)
+  const loadTodayStats = async () => {
     const todayIso = toIsoDate(new Date());
-    (async () => {
-      try {
-        const procRes = await api.get(`/procurement/entries?entry_date=${todayIso}`);
-        const rows = procRes.data || [];
-        setTodayProcurement({
-          count: rows.length,
-          weight: rows.reduce((s, r) => s + Number(r.weight || 0), 0),
-          cost: rows.reduce((s, r) => s + Number(r.total_amount || 0), 0),
-        });
-        // Recent activity — combine today's procurement + payments, latest first
-        const activity = [
-          ...rows.map((r) => ({ kind: "procurement", when: r.created_at,
-            title: `${r.product_name} · ${r.weight} qtl · ${formatClientName(r.client_name)}`,
-            amount: r.total_amount, tone: "muted" })),
-        ];
-        setRecentActivity(activity.sort((a, b) => b.when.localeCompare(a.when)).slice(0, 5));
-      } catch (e) { /* silent */ }
-    })();
-  }, []);
+    try {
+      const [procRes, payRes] = await Promise.all([
+        api.get(`/procurement/entries?entry_date=${todayIso}`),
+        api.get(`/payments/by-date?date_str=${todayIso}`),
+      ]);
+      const rows = procRes.data || [];
+      const pays = payRes.data || [];
+      setTodayProcurement({
+        count: rows.length,
+        weight: rows.reduce((s, r) => s + Number(r.weight || 0), 0),
+        cost: rows.reduce((s, r) => s + Number(r.total_amount || 0), 0),
+      });
+      const activity = [
+        ...rows.map((r) => ({ kind: "procurement", when: r.created_at,
+          title: `${r.product_name} · ${r.weight} qtl · ${formatClientName(r.client_name)}`,
+          amount: r.total_amount })),
+        ...pays.map((p) => ({ kind: p.direction, when: p.created_at,
+          title: `${p.direction === "in" ? t("col.received") : t("col.given")} · ${formatClientName(p.client_name)}`,
+          amount: p.amount })),
+      ];
+      setRecentActivity(activity.sort((a, b) => b.when.localeCompare(a.when)).slice(0, 5));
+    } catch (e) { /* silent */ }
+  };
+  useEffect(() => { loadTodayStats(); }, []);
+
+  const refreshAll = () => { fetchPayments(); loadTodayStats(); };
+
+  const startEdit = (p) => { setEditingPayment(p); setShowAdd(true); };
+
+  const deletePayment = async (p) => {
+    const ok = window.confirm(
+      `Delete this payment?\n\n${formatClientName(p.client_name)} · ${formatCurrency(p.amount)} (${p.direction === "in" ? "received" : "given"})\n\nThis cannot be undone.`
+    );
+    if (!ok) return;
+    try {
+      await api.delete(`/payments/${p.id}`);
+      toast.success("Payment deleted");
+      refreshAll();
+    } catch (err) {
+      toast.error(formatApiError(err));
+    }
+  };
 
   const received = payments.filter((p) => p.direction === "in");
   const given = payments.filter((p) => p.direction === "out");
@@ -336,7 +394,9 @@ export default function Dashboard() {
             {recentActivity.map((a, i) => (
               <li key={i} className="px-5 py-3 flex items-center justify-between text-sm">
                 <div className="flex items-center gap-3">
-                  <Wheat strokeWidth={1.5} className="w-4 h-4 text-stone-400" />
+                  {a.kind === "in" ? <ArrowDownLeft strokeWidth={1.5} className="w-4 h-4 text-emerald-700" />
+                    : a.kind === "out" ? <ArrowUpRight strokeWidth={1.5} className="w-4 h-4 text-orange-700" />
+                    : <Wheat strokeWidth={1.5} className="w-4 h-4 text-stone-400" />}
                   <span className="text-[#1C1917]">{a.title}</span>
                 </div>
                 <span className="font-mono text-[#B45309]">{formatCurrency(a.amount)}</span>
@@ -384,7 +444,7 @@ export default function Dashboard() {
               <div className="space-y-3 py-2" data-testid="skeleton-in">
                 {[1,2,3].map(i => <div key={i} className="skeleton-row" />)}
               </div>
-            ) : <PaymentColumn items={received} emptyMsg={t("col.noReceived")} tone="in" testid="col-received" />}
+            ) : <PaymentColumn items={received} emptyMsg={t("col.noReceived")} tone="in" testid="col-received" onEdit={startEdit} onDelete={deletePayment} />}
           </section>
 
           <section
@@ -404,7 +464,7 @@ export default function Dashboard() {
               <div className="space-y-3 py-2" data-testid="skeleton-out">
                 {[1,2,3].map(i => <div key={i} className="skeleton-row" />)}
               </div>
-            ) : <PaymentColumn items={given} emptyMsg={t("col.noGiven")} tone="out" testid="col-given" />}
+            ) : <PaymentColumn items={given} emptyMsg={t("col.noGiven")} tone="out" testid="col-given" onEdit={startEdit} onDelete={deletePayment} />}
           </section>
         </div>
 
@@ -418,7 +478,7 @@ export default function Dashboard() {
         </aside>
       </div>
 
-      <AddPaymentModal open={showAdd} onOpenChange={setShowAdd} onSaved={fetchPayments} defaultDate={activeDateStr} />
+      <AddPaymentModal open={showAdd} onOpenChange={(v) => { setShowAdd(v); if (!v) setEditingPayment(null); }} onSaved={refreshAll} defaultDate={activeDateStr} editing={editingPayment} />
 
       {/* Calculate confirmation */}
       <Dialog open={showCalcConfirm} onOpenChange={setShowCalcConfirm}>
