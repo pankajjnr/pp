@@ -10,6 +10,7 @@ import uuid
 import bcrypt
 import jwt
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from typing import List, Optional, Literal
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, UploadFile, File
@@ -17,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import OperationFailure, ConfigurationError
 import certifi
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import io
@@ -185,9 +187,14 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Business "today" is decided in the business's own timezone (default IST), NOT
+# the server's UTC clock — otherwise between 00:00 and 05:30 IST the server's
+# "today" is still yesterday and rejects entries the browser calls "today".
+APP_TIMEZONE = ZoneInfo(os.environ.get("APP_TIMEZONE", "Asia/Kolkata"))
+
+
 def today_local_date() -> date:
-    # Use server date as the "today" reference (Asia/Kolkata approximation is fine for now)
-    return datetime.now(timezone.utc).date()
+    return datetime.now(APP_TIMEZONE).date()
 
 
 # ----- Models -----
@@ -241,6 +248,14 @@ class PaymentOut(BaseModel):
     description: Optional[str] = None
     entry_date: str  # YYYY-MM-DD
     created_at: str
+    settlement_id: Optional[str] = None  # set when created by / consumed into a settlement
+
+
+class PaymentUpdate(BaseModel):
+    direction: Optional[Literal["in", "out"]] = None
+    amount: Optional[float] = Field(default=None, gt=0)
+    description: Optional[str] = Field(default=None, max_length=500)
+    entry_date: Optional[str] = None
 
 
 class TotalsOut(BaseModel):
@@ -403,7 +418,7 @@ async def create_client(payload: ClientCreate, _user: dict = Depends(get_current
 
 @api_router.get("/clients", response_model=List[ClientOut])
 async def list_clients(_user: dict = Depends(get_current_user)):
-    clients = await db.clients.find({}, {"_id": 0}).sort("name_lower", 1).to_list(2000)
+    clients = await db.clients.find({}, {"_id": 0}).sort("name_lower", 1).to_list(None)
 
     # Single aggregate over all payments, grouped by client + direction, instead
     # of one aggregate query per client (which was N+1 and slowed this page down
@@ -412,7 +427,7 @@ async def list_clients(_user: dict = Depends(get_current_user)):
     pipeline = [
         {"$group": {"_id": {"client_id": "$client_id", "direction": "$direction"}, "total": {"$sum": "$amount"}}},
     ]
-    agg = await db.payments.aggregate(pipeline).to_list(20000)
+    agg = await db.payments.aggregate(pipeline).to_list(None)
     totals: dict = {}
     for row in agg:
         cid = row["_id"]["client_id"]
@@ -472,9 +487,23 @@ async def delete_client(client_id: str, user: dict = Depends(get_current_user)):
     c = await db.clients.find_one({"id": client_id})
     if not c:
         raise HTTPException(status_code=404, detail="Client not found")
+    if c.get("name_lower") == MUDDAT_CLIENT_NAME.lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Muddat is a system account (it collects settlement deductions) and cannot be deleted.",
+        )
+    # Remove everything that belongs to this client so nothing is left orphaned.
     pay_res = await db.payments.delete_many({"client_id": client_id})
+    proc_res = await db.procurement_entries.delete_many({"client_id": client_id})
+    set_res = await db.procurement_settlements.delete_many({"client_id": client_id})
     await db.clients.delete_one({"id": client_id})
-    return {"ok": True, "deleted_payments": pay_res.deleted_count, "client_name": c["name"]}
+    return {
+        "ok": True,
+        "deleted_payments": pay_res.deleted_count,
+        "deleted_procurement_entries": proc_res.deleted_count,
+        "deleted_settlements": set_res.deleted_count,
+        "client_name": c["name"],
+    }
 
 
 @api_router.get("/clients/{client_id}/ledger")
@@ -482,7 +511,7 @@ async def client_ledger(client_id: str, _user: dict = Depends(get_current_user))
     c = await db.clients.find_one({"id": client_id}, {"_id": 0})
     if not c:
         raise HTTPException(status_code=404, detail="Client not found")
-    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(5000)
+    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(None)
     incoming = [p for p in payments if p["direction"] == "in"]
     outgoing = [p for p in payments if p["direction"] == "out"]
     incoming_total = sum(p["amount"] for p in incoming)
@@ -537,7 +566,7 @@ async def export_client_ledger(client_id: str, format: str = "csv", _user: dict 
     if not c:
         raise HTTPException(status_code=404, detail="Client not found")
     display_name = _display_client_name(c["name"])
-    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(5000)
+    payments = await db.payments.find({"client_id": client_id}, {"_id": 0}).sort("entry_date", -1).to_list(None)
     incoming_total = sum(p["amount"] for p in payments if p["direction"] == "in")
     outgoing_total = sum(p["amount"] for p in payments if p["direction"] == "out")
     net = incoming_total - outgoing_total
@@ -682,27 +711,70 @@ async def create_payment(payload: PaymentCreate, _user: dict = Depends(get_curre
     return PaymentOut(**{k: doc[k] for k in ["id", "client_id", "client_name", "direction", "amount", "description", "entry_date", "created_at"]})
 
 
+@api_router.put("/payments/{payment_id}", response_model=PaymentOut)
+async def update_payment(payment_id: str, payload: PaymentUpdate, _user: dict = Depends(get_current_user)):
+    p = await db.payments.find_one({"id": payment_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if p.get("settlement_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="This payment was created by (or applied to) a settlement. Undo the settlement instead.",
+        )
+    changes: dict = {}
+    if payload.direction is not None:
+        changes["direction"] = payload.direction
+    if payload.amount is not None:
+        changes["amount"] = float(payload.amount)
+    if payload.description is not None:
+        changes["description"] = payload.description.strip() or None
+    if payload.entry_date is not None:
+        try:
+            datetime.strptime(payload.entry_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid entry_date, expected YYYY-MM-DD")
+        changes["entry_date"] = payload.entry_date
+    if changes:
+        await db.payments.update_one({"id": payment_id}, {"$set": changes})
+        p.update(changes)
+    return PaymentOut(**p)
+
+
+@api_router.delete("/payments/{payment_id}")
+async def delete_payment(payment_id: str, _user: dict = Depends(get_current_user)):
+    p = await db.payments.find_one({"id": payment_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    if p.get("settlement_id"):
+        raise HTTPException(
+            status_code=400,
+            detail="This payment was created by (or applied to) a settlement. Undo the settlement instead.",
+        )
+    await db.payments.delete_one({"id": payment_id})
+    return {"ok": True}
+
+
 @api_router.get("/payments/by-date", response_model=List[PaymentOut])
 async def payments_by_date(date_str: str, _user: dict = Depends(get_current_user)):
     try:
         datetime.strptime(date_str, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date, expected YYYY-MM-DD")
-    payments = await db.payments.find({"entry_date": date_str}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    payments = await db.payments.find({"entry_date": date_str}, {"_id": 0}).sort("created_at", -1).to_list(None)
     return [PaymentOut(**p) for p in payments]
 
 
 @api_router.get("/payments/today", response_model=List[PaymentOut])
 async def payments_today(_user: dict = Depends(get_current_user)):
     d = today_local_date().isoformat()
-    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(None)
     return [PaymentOut(**p) for p in payments]
 
 
 @api_router.get("/payments/yesterday", response_model=List[PaymentOut])
 async def payments_yesterday(_user: dict = Depends(get_current_user)):
     d = (today_local_date() - timedelta(days=1)).isoformat()
-    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    payments = await db.payments.find({"entry_date": d}, {"_id": 0}).sort("created_at", -1).to_list(None)
     return [PaymentOut(**p) for p in payments]
 
 
@@ -717,7 +789,7 @@ async def payments_calendar_summary(month: str, _user: dict = Depends(get_curren
     end = month + "-31"
     payments = await db.payments.find(
         {"entry_date": {"$gte": start, "$lte": end}}, {"_id": 0}
-    ).to_list(5000)
+    ).to_list(None)
     summary: dict = {}
     for p in payments:
         d = p["entry_date"]
@@ -785,6 +857,15 @@ class ProcurementOut(BaseModel):
     rate: float
     total_amount: float
     created_at: str
+    is_settled: bool = False
+
+
+class ProcurementUpdate(BaseModel):
+    entry_date: Optional[str] = None
+    client_id: Optional[str] = None
+    product_id: Optional[str] = None
+    weight: Optional[float] = Field(default=None, gt=0)
+    rate: Optional[float] = Field(default=None, gt=0)
 
 
 # --- Product master ---
@@ -916,6 +997,61 @@ async def create_procurement_batch(payload: ProcurementBatchCreate, _user: dict 
     return [ProcurementOut(**_out_fields(d)) for d in docs]
 
 
+@api_router.put("/procurement/entries/{entry_id}", response_model=ProcurementOut)
+async def update_procurement(entry_id: str, payload: ProcurementUpdate, _user: dict = Depends(get_current_user)):
+    doc = await db.procurement_entries.find_one({"id": entry_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    if doc.get("is_settled"):
+        raise HTTPException(status_code=400, detail="This entry is already settled. Undo the settlement first.")
+    changes: dict = {}
+    if payload.entry_date is not None and payload.entry_date != doc["entry_date"]:
+        try:
+            datetime.strptime(payload.entry_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
+        if payload.entry_date not in _allowed_entry_dates():
+            raise HTTPException(status_code=400, detail="Date can only be changed to today or yesterday.")
+        changes["entry_date"] = payload.entry_date
+    if payload.client_id is not None and payload.client_id != doc["client_id"]:
+        c = await db.clients.find_one({"id": payload.client_id}, {"_id": 0})
+        if not c:
+            raise HTTPException(status_code=404, detail="Client not found")
+        changes["client_id"] = c["id"]
+        changes["client_name"] = c["name"]
+    if payload.product_id is not None and payload.product_id != doc["product_id"]:
+        p = await db.master_products.find_one({"id": payload.product_id}, {"_id": 0})
+        if not p:
+            raise HTTPException(status_code=404, detail="Product not found")
+        changes["product_id"] = p["id"]
+        changes["product_name"] = p["name"]
+    if payload.weight is not None:
+        changes["weight"] = float(payload.weight)
+    if payload.rate is not None:
+        changes["rate"] = float(payload.rate)
+    if changes:
+        doc.update(changes)
+        doc["total_amount"] = round(float(doc["weight"]) * float(doc["rate"]), 2)
+        changes["total_amount"] = doc["total_amount"]
+        await db.procurement_entries.update_one(
+            {"id": entry_id, "is_settled": {"$ne": True}}, {"$set": changes}
+        )
+    return ProcurementOut(**{**_out_fields(doc), "is_settled": False})
+
+
+@api_router.delete("/procurement/entries/{entry_id}")
+async def delete_procurement(entry_id: str, _user: dict = Depends(get_current_user)):
+    doc = await db.procurement_entries.find_one({"id": entry_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    if doc.get("is_settled"):
+        raise HTTPException(status_code=400, detail="This entry is already settled. Undo the settlement first.")
+    res = await db.procurement_entries.delete_one({"id": entry_id, "is_settled": {"$ne": True}})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=409, detail="Entry was settled in the meantime. Undo the settlement first.")
+    return {"ok": True}
+
+
 @api_router.get("/procurement/entries", response_model=List[ProcurementOut])
 async def list_procurement(
     client_id: Optional[str] = None,
@@ -939,7 +1075,7 @@ async def list_procurement(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid entry_date (YYYY-MM-DD)")
         q["entry_date"] = entry_date
-    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("created_at", -1).to_list(None)
     return [ProcurementOut(**r) for r in rows]
 
 
@@ -961,7 +1097,7 @@ async def export_procurement(
         q["entry_date"] = entry_date
         scope_label = entry_date
 
-    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", -1).sort("created_at", -1).to_list(10000)
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort([("entry_date", -1), ("created_at", -1)]).to_list(None)
     total_weight = sum(float(r.get("weight", 0)) for r in rows)
     total_cost = sum(float(r.get("total_amount", 0)) for r in rows)
     wavg = (total_cost / total_weight) if total_weight > 0 else 0.0
@@ -1060,7 +1196,7 @@ async def export_client_procurement(
         q["product_id"] = product_id
         product_name_filter = p["name"]
 
-    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    rows = await db.procurement_entries.find(q, {"_id": 0}).sort("entry_date", 1).to_list(None)
 
     # Group by product
     groups: dict[str, dict] = {}
@@ -1287,7 +1423,7 @@ async def _fetch_eligible_entries(client_id: str, from_date: str, to_date: str) 
         "client_id": client_id,
         "entry_date": {"$gte": from_date, "$lte": to_date},
         "is_settled": {"$ne": True},
-    }, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    }, {"_id": 0}).sort("entry_date", 1).to_list(None)
     return rows
 
 
@@ -1402,7 +1538,7 @@ async def list_advance_payments(client_id: str, _user: dict = Depends(get_curren
             "settlement_id": {"$exists": False},
         },
         {"_id": 0},
-    ).sort("entry_date", 1).to_list(5000)
+    ).sort("entry_date", 1).to_list(None)
     return [
         AdvancePaymentOut(
             id=r["id"],
@@ -1413,6 +1549,30 @@ async def list_advance_payments(client_id: str, _user: dict = Depends(get_curren
         )
         for r in rows
     ]
+
+
+def _txn_unsupported(exc: Exception) -> bool:
+    """True when the error just means 'this MongoDB can't do transactions'."""
+    if isinstance(exc, ConfigurationError):
+        return True
+    if isinstance(exc, OperationFailure):
+        msg = str(exc)
+        return exc.code == 20 or "replica set" in msg or "Transaction numbers" in msg
+    return False
+
+
+async def _with_optional_txn(fn):
+    """Run `await fn(session)` inside a MongoDB transaction (Atlas supports
+    them). If the deployment can't do transactions, run `fn(None)` instead —
+    fn is responsible for its own manual rollback in that case."""
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                return await fn(session)
+    except (ConfigurationError, OperationFailure) as exc:
+        if not _txn_unsupported(exc):
+            raise
+    return await fn(None)
 
 
 @api_router.post("/procurement/settlements", response_model=SettlementOut)
@@ -1544,64 +1704,78 @@ async def create_settlement(payload: SettlementCreate, _user: dict = Depends(get
         "created_at": created_ts,
     }
 
-    flagged = False
-    payment_inserted = False
-    muddat_inserted = False
-    advances_consumed = False
-    settlement_inserted = False
-    try:
-        upd = await db.procurement_entries.update_many(
-            {"id": {"$in": entry_ids}, "is_settled": {"$ne": True}},
-            {"$set": {"is_settled": True, "settlement_id": settlement_id}},
-        )
-        if upd.modified_count != len(entry_ids):
-            raise RuntimeError("Entry count mismatch — concurrent settlement suspected")
-        flagged = True
-
-        if payment_doc is not None:
-            await db.payments.insert_one(payment_doc)
-            payment_inserted = True
-
-        if muddat_payment_doc is not None:
-            await db.payments.insert_one(muddat_payment_doc)
-            muddat_inserted = True
-
-        if advance_rows:
-            # Guard with settlement_id $exists:False again to prevent a race
-            # where the same advance got consumed by a concurrent settlement
-            # between the initial fetch and this write.
-            adv_upd = await db.payments.update_many(
-                {
-                    "id": {"$in": [r["id"] for r in advance_rows]},
-                    "settlement_id": {"$exists": False},
-                },
-                {"$set": {"settlement_id": settlement_id, "consumed_as_advance_in": settlement_id}},
+    async def _write_settlement(session):
+        """All the writes that make up one settlement. With a session they run
+        inside one MongoDB transaction (all-or-nothing, handled by the DB). If
+        the database can't do transactions (e.g. standalone local Mongo), the
+        same writes run without one and are undone by hand on failure."""
+        kw = {"session": session} if session is not None else {}
+        done = {"flagged": False, "payment": False, "muddat": False,
+                "advances": False, "settlement": False}
+        try:
+            upd = await db.procurement_entries.update_many(
+                {"id": {"$in": entry_ids}, "is_settled": {"$ne": True}},
+                {"$set": {"is_settled": True, "settlement_id": settlement_id}},
+                **kw,
             )
-            if adv_upd.modified_count != len(advance_rows):
-                raise RuntimeError(
-                    "One or more advance payments were already applied elsewhere — concurrent settlement suspected"
+            if upd.modified_count != len(entry_ids):
+                raise RuntimeError("Entry count mismatch — concurrent settlement suspected")
+            done["flagged"] = True
+
+            if payment_doc is not None:
+                await db.payments.insert_one(dict(payment_doc), **kw)
+                done["payment"] = True
+
+            if muddat_payment_doc is not None:
+                await db.payments.insert_one(dict(muddat_payment_doc), **kw)
+                done["muddat"] = True
+
+            if advance_rows:
+                # Guard with settlement_id $exists:False again to prevent a race
+                # where the same advance got consumed by a concurrent settlement
+                # between the initial fetch and this write.
+                adv_upd = await db.payments.update_many(
+                    {
+                        "id": {"$in": [r["id"] for r in advance_rows]},
+                        "settlement_id": {"$exists": False},
+                    },
+                    {"$set": {"settlement_id": settlement_id, "consumed_as_advance_in": settlement_id}},
+                    **kw,
                 )
-            advances_consumed = True
+                if adv_upd.modified_count != len(advance_rows):
+                    raise RuntimeError(
+                        "One or more advance payments were already applied elsewhere — concurrent settlement suspected"
+                    )
+                done["advances"] = True
 
-        await db.procurement_settlements.insert_one(settlement_doc)
-        settlement_inserted = True
+            await db.procurement_settlements.insert_one(dict(settlement_doc), **kw)
+            done["settlement"] = True
+        except Exception:
+            if session is None:
+                # No transaction to abort — undo what was written, newest first.
+                if done["settlement"]:
+                    await db.procurement_settlements.delete_one({"id": settlement_id})
+                if done["advances"]:
+                    await db.payments.update_many(
+                        {"id": {"$in": [r["id"] for r in advance_rows]}, "settlement_id": settlement_id},
+                        {"$unset": {"settlement_id": "", "consumed_as_advance_in": ""}},
+                    )
+                if done["muddat"]:
+                    await db.payments.delete_one({"id": muddat_payment_id})
+                if done["payment"]:
+                    await db.payments.delete_one({"id": payment_id})
+                if done["flagged"]:
+                    await db.procurement_entries.update_many(
+                        {"settlement_id": settlement_id},
+                        {"$set": {"is_settled": False}, "$unset": {"settlement_id": ""}},
+                    )
+            raise
+
+    try:
+        await _with_optional_txn(_write_settlement)
+    except HTTPException:
+        raise
     except Exception as exc:
-        if settlement_inserted:
-            await db.procurement_settlements.delete_one({"id": settlement_id})
-        if advances_consumed:
-            await db.payments.update_many(
-                {"id": {"$in": [r["id"] for r in advance_rows]}, "settlement_id": settlement_id},
-                {"$unset": {"settlement_id": "", "consumed_as_advance_in": ""}},
-            )
-        if muddat_inserted:
-            await db.payments.delete_one({"id": muddat_payment_id})
-        if payment_inserted:
-            await db.payments.delete_one({"id": payment_id})
-        if flagged:
-            await db.procurement_entries.update_many(
-                {"settlement_id": settlement_id},
-                {"$set": {"is_settled": False}, "$unset": {"settlement_id": ""}},
-            )
         raise HTTPException(
             status_code=500,
             detail=f"Settlement failed and was rolled back: {exc}",
@@ -1635,7 +1809,7 @@ async def list_settlements(
     q: dict = {"from_date": {"$exists": True}}  # ignore any legacy watermark records
     if client_id:
         q["client_id"] = client_id
-    rows = await db.procurement_settlements.find(q, {"_id": 0}).sort("to_date", -1).sort("created_at", -1).to_list(5000)
+    rows = await db.procurement_settlements.find(q, {"_id": 0}).sort([("to_date", -1), ("created_at", -1)]).to_list(None)
     out = []
     for r in rows:
         # Older settlements (pre-advance-payments) won't have these fields —
@@ -1662,7 +1836,7 @@ async def get_settlement(settlement_id: str, _user: dict = Depends(get_current_u
     if not r:
         raise HTTPException(status_code=404, detail="Settlement not found")
     entry_ids = r.get("entry_ids") or []
-    entries = await db.procurement_entries.find({"id": {"$in": entry_ids}}, {"_id": 0}).sort("entry_date", 1).to_list(20000)
+    entries = await db.procurement_entries.find({"id": {"$in": entry_ids}}, {"_id": 0}).sort("entry_date", 1).to_list(None)
     return SettlementDetailOut(
         id=r["id"], client_id=r["client_id"], client_name=r["client_name"],
         from_date=r["from_date"], to_date=r["to_date"],
@@ -1678,6 +1852,44 @@ async def get_settlement(settlement_id: str, _user: dict = Depends(get_current_u
         entries=_to_entry_refs(entries),
         subtotals=_compute_subtotals(entries),
     )
+
+
+@api_router.delete("/procurement/settlements/{settlement_id}")
+async def undo_settlement(settlement_id: str, user: dict = Depends(get_current_user)):
+    """Reverse a settlement: entries become unsettled again, the payment it
+    posted and the Muddat deduction are removed, and any advances it consumed
+    are released so they can be applied again."""
+    _require_admin(user)
+    r = await db.procurement_settlements.find_one({"id": settlement_id, "from_date": {"$exists": True}}, {"_id": 0})
+    if not r:
+        raise HTTPException(status_code=404, detail="Settlement not found")
+
+    result: dict = {}
+
+    async def _undo(session):
+        kw = {"session": session} if session is not None else {}
+        ent = await db.procurement_entries.update_many(
+            {"settlement_id": settlement_id},
+            {"$set": {"is_settled": False}, "$unset": {"settlement_id": ""}},
+            **kw,
+        )
+        # 1) release advances this settlement consumed (they keep existing)
+        await db.payments.update_many(
+            {"consumed_as_advance_in": settlement_id},
+            {"$unset": {"settlement_id": "", "consumed_as_advance_in": ""}},
+            **kw,
+        )
+        # 2) what's left tagged with this settlement are the payments it created
+        pay = await db.payments.delete_many({"settlement_id": settlement_id}, **kw)
+        await db.procurement_settlements.delete_one({"id": settlement_id}, **kw)
+        result["entries_released"] = ent.modified_count
+        result["payments_removed"] = pay.deleted_count
+
+    try:
+        await _with_optional_txn(_undo)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not undo settlement: {exc}")
+    return {"ok": True, **result}
 
 
 async def seed_products():
@@ -1788,7 +2000,7 @@ async def backup_export(user: dict = Depends(get_current_user)):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for coll in BACKUP_COLLECTIONS:
-            docs = await db[coll].find({}, {"_id": 0}).to_list(100000)
+            docs = await db[coll].find({}, {"_id": 0}).to_list(None)
             clean = [_jsonable(d) for d in docs]
             zf.writestr(
                 f"{coll}.json",
