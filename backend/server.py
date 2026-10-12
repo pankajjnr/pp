@@ -18,7 +18,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import OperationFailure, ConfigurationError
+from pymongo import ReturnDocument
+from pymongo.errors import OperationFailure, ConfigurationError, DuplicateKeyError
+from xml.sax.saxutils import escape as xml_escape
 import certifi
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import io
@@ -1892,6 +1894,391 @@ async def undo_settlement(settlement_id: str, user: dict = Depends(get_current_u
     return {"ok": True, **result}
 
 
+# =========================================================================
+# SALES ENTRY MODULE — outgoing stock sold to mills, dispatched by truck.
+# Standalone (like procurement): not linked to the payment ledger.
+# =========================================================================
+
+class SaleBase(BaseModel):
+    product_id: str
+    buyer_name: str = Field(min_length=1, max_length=120)
+    dalal_name: Optional[str] = Field(default=None, max_length=120)  # broker, optional
+    quantity: float = Field(gt=0)  # quintals
+    rate: float = Field(gt=0)      # ₹ per quintal
+    transport_company: str = Field(min_length=1, max_length=120)
+    driver_name: str = Field(min_length=1, max_length=120)
+    driver_phone: Optional[str] = Field(default=None, max_length=20)
+    truck_number: str = Field(min_length=1, max_length=20)
+    dispatch_date: str  # YYYY-MM-DD
+
+
+class SaleCreate(SaleBase):
+    pass
+
+
+class SaleOut(BaseModel):
+    id: str
+    product_id: str
+    product_name: str
+    buyer_name: str
+    dalal_name: Optional[str] = None
+    quantity: float
+    rate: float
+    total_amount: float
+    transport_company: str
+    driver_name: str
+    driver_phone: Optional[str] = None
+    truck_number: str
+    dispatch_date: str
+    entered_by: str
+    bill_no: Optional[str] = None
+    created_at: str
+
+
+def _clean_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    v = " ".join(value.split())
+    return v or None
+
+
+def _normalize_truck(value: str) -> str:
+    return " ".join(value.upper().split())
+
+
+def _normalize_phone(value: Optional[str]) -> Optional[str]:
+    v = _clean_text(value)
+    if not v:
+        return None
+    digits = "".join(ch for ch in v if ch.isdigit())
+    if len(digits) == 12 and digits.startswith("91"):
+        digits = digits[2:]
+    if len(digits) != 10:
+        raise HTTPException(status_code=400, detail="Driver phone must be a 10-digit number")
+    return digits
+
+
+async def _build_sale_doc(payload: SaleBase) -> dict:
+    try:
+        d = datetime.strptime(payload.dispatch_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid dispatch_date (YYYY-MM-DD)")
+    if d > today_local_date():
+        raise HTTPException(status_code=400, detail="Dispatch date cannot be in the future")
+
+    p = await db.master_products.find_one({"id": payload.product_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    buyer = _clean_text(payload.buyer_name)
+    company = _clean_text(payload.transport_company)
+    driver = _clean_text(payload.driver_name)
+    truck = _normalize_truck(payload.truck_number)
+    if not (buyer and company and driver and truck):
+        raise HTTPException(status_code=400, detail="Required fields cannot be blank")
+
+    return {
+        "product_id": p["id"],
+        "product_name": p["name"],
+        "buyer_name": buyer,
+        "dalal_name": _clean_text(payload.dalal_name),
+        "quantity": float(payload.quantity),
+        "rate": float(payload.rate),
+        "total_amount": round(float(payload.quantity) * float(payload.rate), 2),
+        "transport_company": company,
+        "driver_name": driver,
+        "driver_phone": _normalize_phone(payload.driver_phone),
+        "truck_number": truck,
+        "dispatch_date": payload.dispatch_date,
+    }
+
+
+@api_router.post("/sales", response_model=SaleOut)
+async def create_sale(payload: SaleCreate, user: dict = Depends(get_current_user)):
+    doc = await _build_sale_doc(payload)
+    doc.update({
+        "id": str(uuid.uuid4()),
+        "bill_no": await _next_bill_no(doc["dispatch_date"]),
+        "entered_by": user.get("name", "Accountant"),
+        "entered_by_id": user["id"],
+        "created_at": now_iso(),
+    })
+    await db.sales_entries.insert_one(doc)
+    return SaleOut(**doc)
+
+
+@api_router.get("/sales", response_model=List[SaleOut])
+async def list_sales(
+    dispatch_date: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    product_id: Optional[str] = None,
+    buyer_name: Optional[str] = None,
+    dalal_name: Optional[str] = None,
+    limit: int = 200,
+    _user: dict = Depends(get_current_user),
+):
+    q: dict = {}
+    for label, val in (("dispatch_date", dispatch_date), ("from_date", from_date), ("to_date", to_date)):
+        if val:
+            try:
+                datetime.strptime(val, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid {label} (YYYY-MM-DD)")
+    if dispatch_date:
+        q["dispatch_date"] = dispatch_date
+    elif from_date or to_date:
+        rng: dict = {}
+        if from_date:
+            rng["$gte"] = from_date
+        if to_date:
+            rng["$lte"] = to_date
+        q["dispatch_date"] = rng
+    if product_id:
+        q["product_id"] = product_id
+    if buyer_name:
+        q["buyer_name"] = buyer_name
+    if dalal_name:
+        q["dalal_name"] = dalal_name
+    limit = max(1, min(limit, 1000))
+    rows = (
+        await db.sales_entries.find(q, {"_id": 0})
+        .sort([("dispatch_date", -1), ("created_at", -1)])
+        .to_list(limit)
+    )
+    return [SaleOut(**r) for r in rows]
+
+
+@api_router.get("/sales/suggestions")
+async def sale_suggestions(_user: dict = Depends(get_current_user)):
+    """Distinct buyer / dalal / transport names used before — powers autocomplete."""
+    async def distinct(field: str) -> list:
+        vals = await db.sales_entries.distinct(field)
+        return sorted({v for v in vals if v}, key=str.lower)
+
+    return {
+        "buyers": await distinct("buyer_name"),
+        "dalals": await distinct("dalal_name"),
+        "transport_companies": await distinct("transport_company"),
+    }
+
+
+@api_router.put("/sales/{sale_id}", response_model=SaleOut)
+async def update_sale(sale_id: str, payload: SaleCreate, _user: dict = Depends(get_current_user)):
+    existing = await db.sales_entries.find_one({"id": sale_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    changes = await _build_sale_doc(payload)
+    await db.sales_entries.update_one({"id": sale_id}, {"$set": changes})
+    existing.update(changes)
+    return SaleOut(**existing)
+
+
+@api_router.delete("/sales/{sale_id}")
+async def delete_sale(sale_id: str, _user: dict = Depends(get_current_user)):
+    res = await db.sales_entries.delete_one({"id": sale_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    return {"ok": True}
+
+
+# ----- Bills (auto-generated from a sale entry) -----
+BILL_PREFIX = os.environ.get("BILL_PREFIX", "INV")
+BUSINESS_ADDRESS = os.environ.get("BUSINESS_ADDRESS", "")
+BUSINESS_PHONE = os.environ.get("BUSINESS_PHONE", "")
+BUSINESS_GSTIN = os.environ.get("BUSINESS_GSTIN", "")
+
+_ONES = [
+    "", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+    "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen",
+    "Eighteen", "Nineteen",
+]
+_TENS = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+
+def _words_below_1000(n: int) -> str:
+    parts = []
+    if n >= 100:
+        parts.append(_ONES[n // 100] + " Hundred")
+        n %= 100
+    if n >= 20:
+        parts.append((_TENS[n // 10] + (" " + _ONES[n % 10] if n % 10 else "")).strip())
+    elif n > 0:
+        parts.append(_ONES[n])
+    return " ".join(parts)
+
+
+def _num_words(n: int) -> str:
+    """Indian numbering: crore / lakh / thousand."""
+    if n == 0:
+        return "Zero"
+    out = []
+    for div, name in ((10 ** 7, "Crore"), (10 ** 5, "Lakh"), (1000, "Thousand")):
+        if n >= div:
+            out.append(_num_words(n // div) + " " + name)
+            n %= div
+    if n:
+        out.append(_words_below_1000(n))
+    return " ".join(out)
+
+
+def _rupees_in_words(amount: float) -> str:
+    rupees = int(amount)
+    paise = int(round((amount - rupees) * 100))
+    if paise == 100:
+        rupees, paise = rupees + 1, 0
+    text = "Rupees " + _num_words(rupees)
+    if paise:
+        text += " and " + _num_words(paise) + " Paise"
+    return text + " Only"
+
+
+def _financial_year(date_str: str) -> str:
+    """Indian financial year (Apr–Mar) a date falls in, e.g. '2026-27'."""
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    start = d.year if d.month >= 4 else d.year - 1
+    return f"{start}-{str(start + 1)[2:]}"
+
+
+async def _next_bill_no(date_str: str) -> str:
+    """Atomically allocate the next bill number for the financial year of
+    `date_str`, e.g. INV/2026-27/0001. The counter lives in `bill_counters`
+    (included in backups), and a candidate is skipped if a sale already
+    carries it — so a restored/older counter can never produce a duplicate."""
+    fy = _financial_year(date_str)
+    key = f"bill-{fy}"
+    for _ in range(50):
+        try:
+            rec = await db.bill_counters.find_one_and_update(
+                {"id": key},
+                {"$inc": {"seq": 1}},
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+                projection={"_id": 0},
+            )
+        except DuplicateKeyError:
+            continue  # two first-ever requests raced on the upsert; retry
+        candidate = f"{BILL_PREFIX}/{fy}/{int(rec['seq']):04d}"
+        if not await db.sales_entries.find_one({"bill_no": candidate}, {"_id": 1}):
+            return candidate
+    raise HTTPException(status_code=500, detail="Could not allocate a bill number")
+
+
+def _build_bill_story(s: dict) -> list:
+    styles = getSampleStyleSheet()
+    ink, muted, line = colors.HexColor("#1C1917"), colors.HexColor("#57534E"), colors.HexColor("#E7E5E4")
+    biz = ParagraphStyle("bbiz", parent=styles["Title"], fontName="Times-Bold", fontSize=22,
+                         textColor=ink, alignment=0, leading=24, spaceAfter=2)
+    small = ParagraphStyle("bsmall", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5,
+                           textColor=muted, leading=11)
+    label = ParagraphStyle("blabel", parent=styles["Normal"], fontName="Helvetica-Bold", fontSize=7.5,
+                           textColor=colors.HexColor("#78716C"), leading=10)
+    val = ParagraphStyle("bval", parent=styles["Normal"], fontName="Helvetica", fontSize=10,
+                         textColor=ink, leading=13)
+    val_b = ParagraphStyle("bvalb", parent=val, fontName="Helvetica-Bold")
+    title = ParagraphStyle("btitle", parent=styles["Heading1"], fontName="Times-Bold", fontSize=17,
+                           textColor=ink, spaceBefore=8, spaceAfter=8)
+    esc = lambda x: xml_escape(str(x)) if x else ""  # noqa: E731
+
+    story: list = [Paragraph(esc(BUSINESS_NAME), biz)]
+    for txt in (BUSINESS_ADDRESS,
+                f"Phone: {BUSINESS_PHONE}" if BUSINESS_PHONE else "",
+                f"GSTIN: {BUSINESS_GSTIN}" if BUSINESS_GSTIN else ""):
+        if txt:
+            story.append(Paragraph(esc(txt), small))
+    story += [
+        HRFlowable(width="100%", thickness=0.8, color=colors.HexColor("#292524"), spaceBefore=6, spaceAfter=4),
+        Paragraph("SALE BILL", title),
+    ]
+
+    # Billed-to (left) + bill meta (right)
+    left = [Paragraph("BILLED TO", label), Paragraph(esc(s["buyer_name"]), val_b)]
+    right_rows = [
+        [Paragraph("BILL NO.", label), Paragraph(esc(s["bill_no"]), val_b)],
+        [Paragraph("BILL DATE", label), Paragraph(esc(s["dispatch_date"]), val)],
+    ]
+    if s.get("dalal_name"):
+        right_rows.append([Paragraph("BROKER (DALAL)", label), Paragraph(esc(s["dalal_name"]), val)])
+    right = Table(right_rows, colWidths=[32 * mm, 52 * mm])
+    right.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 3), ("TOPPADDING", (0, 0), (-1, -1), 0)]))
+    head = Table([[left, right]], colWidths=[90 * mm, 84 * mm])
+    head.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0)]))
+    story += [head, Spacer(1, 12)]
+
+    # Item table
+    qty, rate, total = float(s["quantity"]), float(s["rate"]), float(s["total_amount"])
+    items = Table(
+        [
+            ["#", "Description", "Qty (Qtl)", "Rate (Rs./Qtl)", "Amount"],
+            ["1", s["product_name"], f"{qty:,.2f}", _fmt_inr(rate), _fmt_inr(total)],
+            ["", "", "", "Total", _fmt_inr(total)],
+        ],
+        colWidths=[12 * mm, 62 * mm, 30 * mm, 34 * mm, 36 * mm],
+    )
+    items.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8.5),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F4F0")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.HexColor("#78716C")),
+        ("FONT", (0, 1), (-1, 1), "Helvetica", 10),
+        ("LINEBELOW", (0, 1), (-1, 1), 0.3, line),
+        ("FONT", (3, 2), (-1, 2), "Helvetica-Bold", 11),
+        ("LINEABOVE", (3, 2), (-1, 2), 0.8, colors.HexColor("#292524")),
+        ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story += [items, Spacer(1, 8)]
+    story.append(Paragraph(f"<b>Amount in words:</b> {esc(_rupees_in_words(total))}", val))
+    story.append(Spacer(1, 16))
+
+    # Transport details
+    def kv(k, v):
+        return [Paragraph(k, label), Paragraph(esc(v) or "—", val)]
+    t_rows = [
+        kv("TRANSPORT COMPANY", s.get("transport_company")) + kv("TRUCK NO.", s.get("truck_number")),
+        kv("DRIVER", s.get("driver_name")) + kv("DRIVER PHONE", s.get("driver_phone")),
+        kv("DISPATCH DATE", s.get("dispatch_date")) + [Paragraph("", val), Paragraph("", val)],
+    ]
+    story.append(Paragraph("TRANSPORT DETAILS", label))
+    story.append(Spacer(1, 4))
+    tt = Table(t_rows, colWidths=[38 * mm, 49 * mm, 28 * mm, 59 * mm])
+    tt.setStyle(TableStyle([
+        ("LINEABOVE", (0, 0), (-1, 0), 0.4, line), ("LINEBELOW", (0, 0), (-1, -1), 0.3, line),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story += [tt, Spacer(1, 40)]
+
+    # Signatures
+    sig = Table(
+        [[Paragraph("Received by (Buyer)", small), Paragraph(f"For {esc(BUSINESS_NAME)}", ParagraphStyle(
+            "sigr", parent=small, alignment=2))],
+         [Spacer(1, 28), Spacer(1, 28)],
+         [Paragraph("Signature", small), Paragraph("Authorised Signatory", ParagraphStyle(
+             "sigr2", parent=small, alignment=2))]],
+        colWidths=[87 * mm, 87 * mm],
+    )
+    sig.setStyle(TableStyle([("LINEABOVE", (0, 2), (0, 2), 0.5, muted), ("LINEABOVE", (1, 2), (1, 2), 0.5, muted),
+                             ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+    story.append(sig)
+    return story
+
+
+@api_router.get("/sales/{sale_id}/bill")
+async def sale_bill(sale_id: str, _user: dict = Depends(get_current_user)):
+    s = await db.sales_entries.find_one({"id": sale_id}, {"_id": 0})
+    if not s:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    if not s.get("bill_no"):
+        # Sale recorded before bills existed — number it now, once.
+        number = await _next_bill_no(s["dispatch_date"])
+        await db.sales_entries.update_one({"id": sale_id, "bill_no": None}, {"$set": {"bill_no": number}})
+        s = await db.sales_entries.find_one({"id": sale_id}, {"_id": 0})
+    filename = f"bill_{s['bill_no'].replace('/', '-')}.pdf"
+    return _pdf_stream(_build_bill_story(s), filename)
+
+
 async def seed_products():
     for name in DEFAULT_PRODUCTS:
         if not await db.master_products.find_one({"name_lower": name.lower()}):
@@ -1933,6 +2320,8 @@ BACKUP_COLLECTIONS = [
     "procurement_entries",
     "payments",
     "procurement_settlements",
+    "sales_entries",
+    "bill_counters",
     "users",
 ]
 
@@ -2156,6 +2545,11 @@ async def on_startup():
     # time a settlement preview or subledger is loaded.
     await db.procurement_entries.create_index([("client_id", 1), ("entry_date", 1)])
     await db.procurement_settlements.create_index([("client_id", 1), ("to_date", -1)])
+    await db.sales_entries.create_index([("dispatch_date", -1), ("created_at", -1)])
+    await db.sales_entries.create_index("buyer_name")
+    await db.sales_entries.create_index("dalal_name")
+    await db.sales_entries.create_index("bill_no")
+    await db.bill_counters.create_index("id", unique=True)
     # One-time cleanup: drop legacy watermark-style settlement records and
     # clear any lingering is_settled flags that referenced them, so we start
     # the new date-range settlement model from a clean slate.
