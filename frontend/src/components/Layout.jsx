@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck, Building2 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 import {
@@ -58,6 +58,7 @@ export default function Layout() {
   const moreItems = [
     { to: "/clients", label: t("nav.clients"), icon: Users, testid: "nav-clients" },
     { to: "/procurement/client-subledger", label: t("nav.clientSubledger"), icon: ScrollText, testid: "nav-client-subledger" },
+    { to: "/sales/companies", label: t("nav.salesCompanies"), icon: Building2, testid: "nav-sales-companies" },
   ];
   const isMoreActive = moreItems.some((n) => location.pathname === n.to || location.pathname.startsWith(n.to + "/"));
 
@@ -81,7 +82,7 @@ export default function Layout() {
             </NavLink>
             <nav className="hidden md:flex items-center gap-1">
               {navItems.map((n) => (
-                <NavLink key={n.to} to={n.to} end={n.to === "/"} data-testid={n.testid}
+                <NavLink key={n.to} to={n.to} end={n.to === "/" || n.to === "/sales"} data-testid={n.testid}
                   className={({ isActive }) =>
                     `px-3 py-2 text-sm flex items-center gap-2 transition-colors ${
                       isActive ? "bg-[#292524] text-[#FAFAF9]" : "text-stone-700 hover:bg-[#F0EFEA]"
@@ -139,7 +140,7 @@ export default function Layout() {
         <div className="md:hidden border-t border-[#E7E5E4] overflow-x-auto">
           <div className="flex px-4 gap-1 py-2 min-w-max">
             {navItems.map((n) => (
-              <NavLink key={n.to} to={n.to} end={n.to === "/"} data-testid={`${n.testid}-mobile`}
+              <NavLink key={n.to} to={n.to} end={n.to === "/" || n.to === "/sales"} data-testid={`${n.testid}-mobile`}
                 className={({ isActive }) =>
                   `px-3 py-2 text-xs flex items-center gap-1 whitespace-nowrap ${
                     isActive ? "bg-[#292524] text-white" : "text-stone-700"
