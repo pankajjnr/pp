@@ -5,6 +5,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import os
+import re
 import logging
 import uuid
 import bcrypt
@@ -28,11 +29,11 @@ import csv
 import json
 import zipfile
 from bson import ObjectId
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
 from reportlab.pdfgen.canvas import Canvas
 
 
@@ -69,12 +70,13 @@ class _NumberedCanvas(Canvas):
         self.setFont("Helvetica", 8)
         self.setFillColor(colors.HexColor("#78716C"))
         self.drawString(18 * mm, 10 * mm, self._footer_left)
+        right = self._pagesize[0] - 18 * mm  # 192mm on portrait A4, wider on landscape
         self.drawRightString(
-            192 * mm, 10 * mm, f"Page {self.getPageNumber()} of {total_pages}"
+            right, 10 * mm, f"Page {self.getPageNumber()} of {total_pages}"
         )
         self.setStrokeColor(colors.HexColor("#E7E5E4"))
         self.setLineWidth(0.4)
-        self.line(18 * mm, 12 * mm, 192 * mm, 12 * mm)
+        self.line(18 * mm, 12 * mm, right, 12 * mm)
 
 
 def _pdf_letterhead_flowables(doc_title: str, meta_lines: list[str]) -> list:
@@ -105,7 +107,7 @@ def _pdf_letterhead_flowables(doc_title: str, meta_lines: list[str]) -> list:
     return flows
 
 
-def _pdf_stream(story: list, filename: str) -> StreamingResponse:
+def _pdf_stream(story: list, filename: str, pagesize=A4) -> StreamingResponse:
     """Build a PDF with shared margins + numbered footer canvas, return StreamingResponse."""
     footer_left = (
         f"Generated {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')} "
@@ -113,7 +115,7 @@ def _pdf_stream(story: list, filename: str) -> StreamingResponse:
     )
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
-        buf, pagesize=A4,
+        buf, pagesize=pagesize,
         leftMargin=18 * mm, rightMargin=18 * mm,
         topMargin=18 * mm, bottomMargin=18 * mm,
         title=BUSINESS_NAME,
@@ -1942,20 +1944,25 @@ def _clean_text(value: Optional[str]) -> Optional[str]:
     return v or None
 
 
+def _clean_upper(value: Optional[str]) -> Optional[str]:
+    """Trim, collapse spaces and force CAPITALS (names are stored uppercase so
+    'Krishna Mills' and 'krishna mills' can never become two different names)."""
+    v = _clean_text(value)
+    return v.upper() if v else None
+
+
 def _normalize_truck(value: str) -> str:
     return " ".join(value.upper().split())
 
 
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
+    """Optional. If given it must be exactly 10 digits — nothing else is accepted."""
     v = _clean_text(value)
     if not v:
         return None
-    digits = "".join(ch for ch in v if ch.isdigit())
-    if len(digits) == 12 and digits.startswith("91"):
-        digits = digits[2:]
-    if len(digits) != 10:
-        raise HTTPException(status_code=400, detail="Driver phone must be a 10-digit number")
-    return digits
+    if not re.fullmatch(r"[0-9]{10}", v):
+        raise HTTPException(status_code=400, detail="Driver phone must be exactly 10 digits")
+    return v
 
 
 async def _build_sale_doc(payload: SaleBase) -> dict:
@@ -1970,9 +1977,9 @@ async def _build_sale_doc(payload: SaleBase) -> dict:
     if not p:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    buyer = _clean_text(payload.buyer_name)
-    company = _clean_text(payload.transport_company)
-    driver = _clean_text(payload.driver_name)
+    buyer = _clean_upper(payload.buyer_name)
+    company = _clean_upper(payload.transport_company)
+    driver = _clean_upper(payload.driver_name)
     truck = _normalize_truck(payload.truck_number)
     if not (buyer and company and driver and truck):
         raise HTTPException(status_code=400, detail="Required fields cannot be blank")
@@ -1981,7 +1988,7 @@ async def _build_sale_doc(payload: SaleBase) -> dict:
         "product_id": p["id"],
         "product_name": p["name"],
         "buyer_name": buyer,
-        "dalal_name": _clean_text(payload.dalal_name),
+        "dalal_name": _clean_upper(payload.dalal_name),
         "quantity": float(payload.quantity),
         "rate": float(payload.rate),
         "total_amount": round(float(payload.quantity) * float(payload.rate), 2),
@@ -2054,7 +2061,8 @@ async def sale_suggestions(_user: dict = Depends(get_current_user)):
     """Distinct buyer / dalal / transport names used before — powers autocomplete."""
     async def distinct(field: str) -> list:
         vals = await db.sales_entries.distinct(field)
-        return sorted({v for v in vals if v}, key=str.lower)
+        # Upper-case + de-duplicate, so older mixed-case entries show once.
+        return sorted({" ".join(v.split()).upper() for v in vals if v and v.strip()})
 
     return {
         "buyers": await distinct("buyer_name"),
@@ -2279,6 +2287,407 @@ async def sale_bill(sale_id: str, _user: dict = Depends(get_current_user)):
     return _pdf_stream(_build_bill_story(s), filename)
 
 
+# =========================================================================
+# SALES BY COMPANY — statement of every sale to a company, payments received
+# from it, and the running balance (what it still owes).
+# Balance = total sold − payments received. Positive = due from the company;
+# negative = advance received.
+# =========================================================================
+
+class SalePaymentCreate(BaseModel):
+    buyer_name: str = Field(min_length=1, max_length=120)
+    amount: float = Field(gt=0)
+    payment_date: str  # YYYY-MM-DD
+    mode: Literal["cash", "bank", "upi", "cheque", "other"] = "cash"
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class SalePaymentOut(BaseModel):
+    id: str
+    buyer_name: str
+    amount: float
+    payment_date: str
+    mode: str
+    note: Optional[str] = None
+    entered_by: str
+    created_at: str
+
+
+def _norm_name(value: Optional[str]) -> str:
+    """Canonical company key: trimmed, single-spaced, CAPITALS."""
+    return " ".join((value or "").split()).upper()
+
+
+async def _buyer_variants(norm: str) -> list:
+    """Every stored spelling of one company (older entries may be mixed-case)."""
+    names = await db.sales_entries.distinct("buyer_name")
+    return [n for n in names if _norm_name(n) == norm]
+
+
+def _check_ymd(value: Optional[str], label: str) -> None:
+    if not value:
+        return
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {label} (YYYY-MM-DD)")
+
+
+@api_router.post("/sales/payments", response_model=SalePaymentOut)
+async def create_sale_payment(payload: SalePaymentCreate, user: dict = Depends(get_current_user)):
+    buyer = _norm_name(payload.buyer_name)
+    if not buyer:
+        raise HTTPException(status_code=400, detail="Company name is required")
+    _check_ymd(payload.payment_date, "payment_date")
+    if datetime.strptime(payload.payment_date, "%Y-%m-%d").date() > today_local_date():
+        raise HTTPException(status_code=400, detail="Payment date cannot be in the future")
+    if not await _buyer_variants(buyer):
+        raise HTTPException(status_code=404, detail="No sales recorded for this company")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "buyer_name": buyer,
+        "amount": round(float(payload.amount), 2),
+        "payment_date": payload.payment_date,
+        "mode": payload.mode,
+        "note": _clean_text(payload.note),
+        "entered_by": user.get("name", "Accountant"),
+        "entered_by_id": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.sale_payments.insert_one(doc)
+    return SalePaymentOut(**doc)
+
+
+@api_router.delete("/sales/payments/{payment_id}")
+async def delete_sale_payment(payment_id: str, _user: dict = Depends(get_current_user)):
+    res = await db.sale_payments.delete_one({"id": payment_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return {"ok": True}
+
+
+@api_router.get("/sales/companies")
+async def list_sale_companies(_user: dict = Depends(get_current_user)):
+    """One row per company: trucks, quantity, sold, received, balance, last dates."""
+    sales = await db.sales_entries.find(
+        {}, {"_id": 0, "buyer_name": 1, "quantity": 1, "total_amount": 1, "dispatch_date": 1}
+    ).to_list(None)
+    pays = await db.sale_payments.find(
+        {}, {"_id": 0, "buyer_name": 1, "amount": 1, "payment_date": 1}
+    ).to_list(None)
+
+    agg: dict = {}
+    for s in sales:
+        key = _norm_name(s.get("buyer_name"))
+        if not key:
+            continue
+        a = agg.setdefault(key, {"buyer_name": key, "trucks": 0, "total_quantity": 0.0, "total_amount": 0.0,
+                                 "total_paid": 0.0, "last_sale_date": None, "last_payment_date": None})
+        a["trucks"] += 1
+        a["total_quantity"] += float(s.get("quantity", 0))
+        a["total_amount"] += float(s.get("total_amount", 0))
+        d = s.get("dispatch_date")
+        if d and (a["last_sale_date"] is None or d > a["last_sale_date"]):
+            a["last_sale_date"] = d
+    for p in pays:
+        a = agg.get(_norm_name(p.get("buyer_name")))
+        if a is None:
+            continue
+        a["total_paid"] += float(p.get("amount", 0))
+        d = p.get("payment_date")
+        if d and (a["last_payment_date"] is None or d > a["last_payment_date"]):
+            a["last_payment_date"] = d
+
+    out = []
+    for a in agg.values():
+        a["total_quantity"] = round(a["total_quantity"], 2)
+        a["total_amount"] = round(a["total_amount"], 2)
+        a["total_paid"] = round(a["total_paid"], 2)
+        a["balance"] = round(a["total_amount"] - a["total_paid"], 2)
+        out.append(a)
+    out.sort(key=lambda r: r["buyer_name"])
+    return out
+
+
+async def _build_statement(
+    buyer_name: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    product_id: Optional[str] = None,
+) -> dict:
+    norm = _norm_name(buyer_name)
+    if not norm:
+        raise HTTPException(status_code=400, detail="Company name is required")
+    _check_ymd(from_date, "from_date")
+    _check_ymd(to_date, "to_date")
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=400, detail="from_date cannot be after to_date")
+
+    variants = await _buyer_variants(norm)
+    if not variants:
+        raise HTTPException(status_code=404, detail="No sales recorded for this company")
+
+    q: dict = {"buyer_name": {"$in": variants}}
+    if product_id:
+        q["product_id"] = product_id
+    sales = await db.sales_entries.find(q, {"_id": 0}).to_list(None)
+
+    # Payments aren't tied to a product, so a balance only makes sense for the
+    # whole company. With a product filter we list sales only.
+    with_payments = not product_id
+    payments = (
+        await db.sale_payments.find({"buyer_name": norm}, {"_id": 0}).to_list(None)
+        if with_payments else []
+    )
+
+    def in_range(d: str) -> bool:
+        return (not from_date or d >= from_date) and (not to_date or d <= to_date)
+
+    opening = 0.0
+    if with_payments and from_date:
+        opening = (
+            sum(float(s["total_amount"]) for s in sales if s["dispatch_date"] < from_date)
+            - sum(float(p["amount"]) for p in payments if p["payment_date"] < from_date)
+        )
+
+    events = (
+        [("sale", s["dispatch_date"], 0, s.get("created_at", ""), s) for s in sales if in_range(s["dispatch_date"])]
+        + [("payment", p["payment_date"], 1, p.get("created_at", ""), p) for p in payments if in_range(p["payment_date"])]
+    )
+    events.sort(key=lambda e: (e[1], e[2], e[3]))
+
+    running = opening
+    rows: list = []
+    sold_amount = sold_qty = paid_total = 0.0
+    trucks = 0
+    by_product: dict = {}
+    for kind, d, _order, _created, x in events:
+        if kind == "sale":
+            amt = float(x["total_amount"])
+            running += amt
+            sold_amount += amt
+            sold_qty += float(x["quantity"])
+            trucks += 1
+            bp = by_product.setdefault(x["product_name"], {"product_name": x["product_name"], "trucks": 0, "quantity": 0.0, "amount": 0.0})
+            bp["trucks"] += 1
+            bp["quantity"] += float(x["quantity"])
+            bp["amount"] += amt
+            rows.append({
+                "type": "sale", "id": x["id"], "date": d, "bill_no": x.get("bill_no"),
+                "product_name": x["product_name"], "quantity": float(x["quantity"]), "rate": float(x["rate"]),
+                "amount": amt, "dalal_name": x.get("dalal_name"), "truck_number": x.get("truck_number"),
+                "driver_name": x.get("driver_name"), "driver_phone": x.get("driver_phone"),
+                "transport_company": x.get("transport_company"),
+                "running_balance": round(running, 2) if with_payments else None,
+            })
+        else:
+            amt = float(x["amount"])
+            running -= amt
+            paid_total += amt
+            rows.append({
+                "type": "payment", "id": x["id"], "date": d, "amount": amt,
+                "mode": x.get("mode"), "note": x.get("note"), "entered_by": x.get("entered_by"),
+                "running_balance": round(running, 2),
+            })
+
+    return {
+        "buyer_name": norm,
+        "from_date": from_date,
+        "to_date": to_date,
+        "product_id": product_id,
+        "with_payments": with_payments,
+        "opening_balance": round(opening, 2) if with_payments else None,
+        "rows": rows,
+        "totals": {
+            "trucks": trucks,
+            "quantity": round(sold_qty, 2),
+            "sales_amount": round(sold_amount, 2),
+            "payments_total": round(paid_total, 2),
+            "closing_balance": round(opening + sold_amount - paid_total, 2) if with_payments else None,
+            "avg_rate": round(sold_amount / sold_qty, 2) if sold_qty > 0 else None,
+        },
+        "product_subtotals": [
+            {**v, "quantity": round(v["quantity"], 2), "amount": round(v["amount"], 2)}
+            for v in sorted(by_product.values(), key=lambda v: v["product_name"])
+        ],
+    }
+
+
+@api_router.get("/sales/companies/statement")
+async def company_statement(
+    buyer_name: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    product_id: Optional[str] = None,
+    _user: dict = Depends(get_current_user),
+):
+    return await _build_statement(buyer_name, from_date, to_date, product_id)
+
+
+def _statement_csv(st: dict) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([f"{BUSINESS_NAME} - Sales Statement"])
+    w.writerow(["Company", st["buyer_name"]])
+    w.writerow(["Period", f"{st['from_date'] or 'Start'} to {st['to_date'] or 'Today'}"])
+    w.writerow([])
+    w.writerow(["Date", "Type", "Bill No", "Product", "Quantity (Qtl)", "Rate (Rs./Qtl)", "Amount (Rs.)",
+                "Received (Rs.)", "Balance (Rs.)", "Dalal", "Truck", "Driver", "Driver Phone",
+                "Transport Company", "Payment Mode", "Note"])
+    if st["with_payments"] and st["from_date"]:
+        w.writerow([st["from_date"], "Opening balance", "", "", "", "", "", "", f"{st['opening_balance']:.2f}"])
+    for r in st["rows"]:
+        bal = "" if r["running_balance"] is None else f"{r['running_balance']:.2f}"
+        if r["type"] == "sale":
+            w.writerow([r["date"], "Sale", r.get("bill_no") or "", r["product_name"], f"{r['quantity']:.2f}",
+                        f"{r['rate']:.2f}", f"{r['amount']:.2f}", "", bal, r.get("dalal_name") or "",
+                        r.get("truck_number") or "", r.get("driver_name") or "", r.get("driver_phone") or "",
+                        r.get("transport_company") or "", "", ""])
+        else:
+            w.writerow([r["date"], "Payment", "", "", "", "", "", f"{r['amount']:.2f}", bal, "", "", "", "", "",
+                        (r.get("mode") or "").upper(), r.get("note") or ""])
+    t = st["totals"]
+    w.writerow([])
+    w.writerow(["TOTAL", "", "", "", f"{t['quantity']:.2f}", f"{t['avg_rate'] or 0:.2f}",
+                f"{t['sales_amount']:.2f}", f"{t['payments_total']:.2f}",
+                "" if t["closing_balance"] is None else f"{t['closing_balance']:.2f}"])
+    w.writerow(["Trucks", t["trucks"]])
+    if len(st["product_subtotals"]) > 1:
+        w.writerow([])
+        w.writerow(["Product", "Trucks", "Quantity (Qtl)", "Amount (Rs.)"])
+        for p in st["product_subtotals"]:
+            w.writerow([p["product_name"], p["trucks"], f"{p['quantity']:.2f}", f"{p['amount']:.2f}"])
+    return buf.getvalue().encode("utf-8-sig")  # BOM so Excel opens it cleanly
+
+
+def _statement_story(st: dict) -> list:
+    esc = lambda x: xml_escape(str(x)) if x else ""  # noqa: E731
+    styles = getSampleStyleSheet()
+    cell = ParagraphStyle("sc_cell", parent=styles["Normal"], fontName="Helvetica", fontSize=8, leading=10)
+    cell_b = ParagraphStyle("sc_cellb", parent=cell, fontName="Helvetica-Bold")
+    muted = ParagraphStyle("sc_muted", parent=cell, textColor=colors.HexColor("#78716C"), fontSize=7.5)
+    section = ParagraphStyle("sc_section", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=10,
+                             textColor=colors.HexColor("#1C1917"), spaceBefore=12, spaceAfter=6)
+    t = st["totals"]
+    period = f"{st['from_date'] or 'Start'} to {st['to_date'] or 'Today'}"
+    story = _pdf_letterhead_flowables(
+        "Sales Statement",
+        [f"<b>Company:</b> {esc(st['buyer_name'])}", f"<b>Period:</b> {period}"],
+    )
+
+    def money(n):
+        return _fmt_inr(float(n))
+
+    wp = st["with_payments"]
+    summary = [[
+        "Trucks", "Quantity (Qtl)", "Total Sold", "Received" if wp else "", "Balance Due" if wp else "",
+    ], [
+        str(t["trucks"]), f"{t['quantity']:,.2f}", money(t["sales_amount"]),
+        money(t["payments_total"]) if wp else "", money(t["closing_balance"]) if wp else "",
+    ]]
+    sm = Table(summary, colWidths=[40 * mm, 50 * mm, 55 * mm, 55 * mm, 55 * mm])
+    sm.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8), ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+        ("FONT", (0, 1), (-1, 1), "Helvetica-Bold", 12), ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F5F4F0")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LINEBELOW", (0, 1), (-1, 1), 0.6, colors.HexColor("#78716C")),
+    ]))
+    story.append(sm)
+    if not wp:
+        story.append(Paragraph("Product filter applied: payments and balance are not shown.", muted))
+
+    story.append(Paragraph("SALES &amp; PAYMENTS", section))
+    header = ["Date", "Bill No", "Product", "Qty (Qtl)", "Rate", "Amount", "Received", "Balance", "Dalal", "Truck / Driver / Transport"]
+    data: list = [header]
+    pay_rows: list = []
+    if wp and st["from_date"]:
+        data.append([st["from_date"], Paragraph("<b>Opening balance</b>", cell), "", "", "", "", "",
+                     money(st["opening_balance"]), "", ""])
+    for r in st["rows"]:
+        bal = "" if r["running_balance"] is None else money(r["running_balance"])
+        if r["type"] == "sale":
+            detail = f"<b>{esc(r.get('truck_number'))}</b><br/>{esc(r.get('driver_name'))}"
+            if r.get("driver_phone"):
+                detail += f" ({esc(r['driver_phone'])})"
+            detail += f"<br/>{esc(r.get('transport_company'))}"
+            data.append([r["date"], Paragraph(esc(r.get("bill_no")), cell), Paragraph(esc(r["product_name"]), cell),
+                         f"{r['quantity']:,.2f}", money(r["rate"]), money(r["amount"]), "", bal,
+                         Paragraph(esc(r.get("dalal_name")) or "-", cell), Paragraph(detail, cell)])
+        else:
+            pay_rows.append(len(data))
+            note = f" - {esc(r['note'])}" if r.get("note") else ""
+            data.append([r["date"], Paragraph(f"<b>PAYMENT</b> ({esc((r.get('mode') or '').upper())})", cell), "",
+                         "", "", "", money(r["amount"]), bal, "", Paragraph(f"Received{note}", cell)])
+    if not st["rows"]:
+        data.append(["-", "No sales or payments in this period", "", "", "", "", "", "", "", ""])
+    data.append(["", Paragraph("<b>TOTAL</b> (avg rate)", cell), "", f"{t['quantity']:,.2f}", money(t["avg_rate"] or 0),
+                 money(t["sales_amount"]), money(t["payments_total"]) if wp else "",
+                 money(t["closing_balance"]) if wp else "", "", ""])
+
+    widths = [21, 30, 22, 17, 24, 25, 24, 26, 22, 50]  # mm — 261mm usable on landscape A4
+    tbl = Table(data, colWidths=[w * mm for w in widths], repeatRows=1)
+    style = [
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8), ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F4F0")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.6, colors.HexColor("#78716C")),
+        ("FONT", (0, 1), (-1, -1), "Helvetica", 8),
+        ("LINEBELOW", (0, 1), (-1, -2), 0.2, colors.HexColor("#E7E5E4")),
+        ("ALIGN", (3, 0), (7, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("FONT", (0, -1), (-1, -1), "Helvetica-Bold", 8.5),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.HexColor("#292524")),
+    ]
+    for i in pay_rows:
+        style.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#EEF6EE")))
+    tbl.setStyle(TableStyle(style))
+    story.append(tbl)
+
+    if len(st["product_subtotals"]) > 1:
+        pdata = [["Product", "Trucks", "Quantity (Qtl)", "Amount"]] + [
+            [p["product_name"], str(p["trucks"]), f"{p['quantity']:,.2f}", money(p["amount"])]
+            for p in st["product_subtotals"]
+        ]
+        pt = Table(pdata, colWidths=[70 * mm, 30 * mm, 45 * mm, 50 * mm])
+        pt.setStyle(TableStyle([
+            ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8), ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#78716C")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F5F4F0")),
+            ("FONT", (0, 1), (-1, -1), "Helvetica", 9), ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.2, colors.HexColor("#E7E5E4")),
+            ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        pt.hAlign = "LEFT"
+        story.append(KeepTogether([Paragraph("PRODUCT-WISE TOTALS", section), pt]))
+    if wp:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            "Balance = total sold - payments received. A positive balance is due from the company; "
+            "a negative balance is an advance received.", muted))
+    return story
+
+
+@api_router.get("/sales/companies/statement/export")
+async def export_company_statement(
+    buyer_name: str,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    product_id: Optional[str] = None,
+    file_format: str = "pdf",
+    _user: dict = Depends(get_current_user),
+):
+    st = await _build_statement(buyer_name, from_date, to_date, product_id)
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", st["buyer_name"]).strip("_") or "company"
+    if file_format == "csv":
+        return StreamingResponse(
+            io.BytesIO(_statement_csv(st)),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="sales_{safe}.csv"'},
+        )
+    if file_format != "pdf":
+        raise HTTPException(status_code=400, detail="file_format must be pdf or csv")
+    return _pdf_stream(_statement_story(st), f"sales_{safe}.pdf", pagesize=landscape(A4))
+
+
 async def seed_products():
     for name in DEFAULT_PRODUCTS:
         if not await db.master_products.find_one({"name_lower": name.lower()}):
@@ -2322,6 +2731,7 @@ BACKUP_COLLECTIONS = [
     "procurement_settlements",
     "sales_entries",
     "bill_counters",
+    "sale_payments",
     "users",
 ]
 
@@ -2550,6 +2960,7 @@ async def on_startup():
     await db.sales_entries.create_index("dalal_name")
     await db.sales_entries.create_index("bill_no")
     await db.bill_counters.create_index("id", unique=True)
+    await db.sale_payments.create_index([("buyer_name", 1), ("payment_date", -1)])
     # One-time cleanup: drop legacy watermark-style settlement records and
     # clear any lingering is_settled flags that referenced them, so we start
     # the new date-range settlement model from a clean slate.
