@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Truck, Pencil, Trash2, Save, X, CalendarDays, FileText } from "lucide-react";
+import { Truck, Pencil, Trash2, Save, X, CalendarDays, FileText, Check, Building2 } from "lucide-react";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import api, { formatCurrency, formatDate, formatApiError } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 import usePageTitle from "@/hooks/usePageTitle";
 import EmptyState from "@/components/EmptyState";
+import {
+  Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogDescription,
+} from "@/components/ui/dialog";
 
 function toIsoDate(d) {
   const y = d.getFullYear();
@@ -27,6 +31,163 @@ function Field({ label, required, optional, children, className = "" }) {
       </label>
       <div className="mt-2">{children}</div>
     </div>
+  );
+}
+
+
+// ---- input helpers (shared by the form and the review popup) ---------------
+const plainHandler = (setter, key) => (e) => setter((f) => ({ ...f, [key]: e.target.value }));
+
+// Names are CAPITALS only: convert as the person types, and keep the cursor
+// where it was so editing in the middle of a name doesn't jump to the end.
+const upperHandler = (setter, key) => (e) => {
+  const el = e.target;
+  const pos = el.selectionStart;
+  const value = el.value.toUpperCase();
+  setter((f) => ({ ...f, [key]: value }));
+  requestAnimationFrame(() => {
+    try { el.setSelectionRange(pos, pos); } catch { /* input not focusable */ }
+  });
+};
+
+// Phone: digits only, never more than 10. A pasted "+91 98765 43210" or
+// "098765 43210" is reduced to the plain 10-digit number.
+function cleanPhone(raw) {
+  let d = String(raw || "").replace(/\D/g, "");
+  if (d.length >= 12 && d.startsWith("91")) d = d.slice(2);
+  else if (d.length === 11 && d.startsWith("0")) d = d.slice(1);
+  return d.slice(0, 10);
+}
+const phoneHandler = (setter) => (e) =>
+  setter((f) => ({ ...f, phone: cleanPhone(e.target.value) }));
+
+/**
+ * All editable sale fields. Rendered twice: in the main form and inside the
+ * review popup (where the last corrections are made before saving).
+ */
+function SaleFields({ v, onText, onUpper, onPhone, products, suggest, todayIso, t, idp, tp }) {
+  const q = parseFloat(v.quantity);
+  const r = parseFloat(v.rate);
+  const totalAmount = isNaN(q) || isNaN(r) ? null : +(q * r).toFixed(2);
+  return (
+    <>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        <Field label={t("sales.product")} required>
+          <select
+            value={v.productId}
+            onChange={onText("productId")}
+            data-testid={`${tp}product-select`}
+            className={inputCls}
+          >
+            <option value="">{t("sales.selectProduct")}</option>
+            {products.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+        </Field>
+
+        <Field label={t("sales.buyer")} required>
+          <input
+            type="text" list={`${idp}-buyers`} value={v.buyer} onChange={onUpper("buyer")}
+            placeholder={t("sales.buyerPh")} data-testid={`${tp}buyer-input`}
+            className={inputCls} maxLength={120}
+          />
+          <datalist id={`${idp}-buyers`}>
+            {suggest.buyers.map((b) => <option key={b} value={b} />)}
+          </datalist>
+        </Field>
+
+        <Field label={t("sales.dalal")} optional={t("sales.dalalOptional")}>
+          <input
+            type="text" list={`${idp}-dalals`} value={v.dalal} onChange={onUpper("dalal")}
+            placeholder={t("sales.dalalPh")} data-testid={`${tp}dalal-input`}
+            className={inputCls} maxLength={120}
+          />
+          <datalist id={`${idp}-dalals`}>
+            {suggest.dalals.map((d) => <option key={d} value={d} />)}
+          </datalist>
+        </Field>
+
+        <div className="hidden md:block" />
+
+        <Field label={t("sales.quantity")} required>
+          <input
+            type="number" step="0.01" min="0" inputMode="decimal"
+            value={v.quantity} onChange={onText("quantity")}
+            placeholder={t("sales.quantityPh")} data-testid={`${tp}quantity-input`}
+            className={`${inputCls} font-mono`}
+          />
+        </Field>
+
+        <Field label={t("sales.rate")} required>
+          <input
+            type="number" step="0.01" min="0" inputMode="decimal"
+            value={v.rate} onChange={onText("rate")}
+            placeholder={t("sales.ratePh")} data-testid={`${tp}rate-input`}
+            className={`${inputCls} font-mono`}
+          />
+        </Field>
+      </div>
+
+      <div
+        className="flex items-center justify-between bg-[#FBF1DE] border border-[#F0DDB4] px-5 py-4"
+        data-testid={`${tp}amount-box`}
+      >
+        <span className="text-sm font-medium text-[#92400E]">{t("sales.amount")}:</span>
+        <span className="font-mono text-2xl text-[#92400E]" data-testid={`${tp}total-amount`}>
+          {totalAmount === null ? "₹ —" : formatCurrency(totalAmount)}
+        </span>
+      </div>
+
+      {/* ---------- Transport ---------- */}
+      <div className="pt-5 border-t border-[#E7E5E4] space-y-5">
+        <h3 className="text-xs uppercase tracking-widest text-stone-600 font-semibold">
+          {t("sales.transport")}
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+          <Field label={t("sales.company")} required>
+            <input
+              type="text" list={`${idp}-companies`} value={v.company} onChange={onUpper("company")}
+              placeholder={t("sales.companyPh")} data-testid={`${tp}company-input`}
+              className={inputCls} maxLength={120}
+            />
+            <datalist id={`${idp}-companies`}>
+              {suggest.transport_companies.map((c) => <option key={c} value={c} />)}
+            </datalist>
+          </Field>
+          <Field label={t("sales.driver")} required>
+            <input
+              type="text" value={v.driver} onChange={onUpper("driver")}
+              placeholder={t("sales.driverPh")} data-testid={`${tp}driver-input`}
+              className={inputCls} maxLength={120}
+            />
+          </Field>
+          <Field label={t("sales.phone")}>
+            <input
+              type="tel" inputMode="numeric" pattern="[0-9]*" value={v.phone} onChange={onPhone}
+              placeholder={t("sales.phonePh")} data-testid={`${tp}phone-input`}
+              className={`${inputCls} font-mono`} maxLength={10}
+            />
+          </Field>
+          <Field label={t("sales.truck")} required className="md:col-span-2">
+            <input
+              type="text" value={v.truck} onChange={onUpper("truck")}
+              placeholder={t("sales.truckPh")} data-testid={`${tp}truck-input`}
+              className={`${inputCls} font-mono uppercase placeholder:normal-case`} maxLength={20}
+            />
+          </Field>
+          <Field
+            label={t("sales.dispatchDate")} required
+          >
+            <input
+              type="date" value={v.dispatchDate} onChange={onText("dispatchDate")}
+              max={todayIso} data-testid={`${tp}date-input`}
+              className={`${inputCls} font-mono`}
+            />
+          </Field>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -65,14 +226,18 @@ export default function SalesEntry() {
   const [saving, setSaving] = useState(false);
   const [filterDate, setFilterDate] = useState(""); // "" = last 30 days
 
-  const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
+  const set = (key) => plainHandler(setForm, key);
+  const setUpper = (key) => upperHandler(setForm, key);
+  const onPhone = phoneHandler(setForm);
 
-  const totalAmount = useMemo(() => {
-    const q = parseFloat(form.quantity);
-    const r = parseFloat(form.rate);
-    if (isNaN(q) || isNaN(r)) return null;
-    return +(q * r).toFixed(2);
-  }, [form.quantity, form.rate]);
+  // Review popup: works on a COPY of the form, so nothing in the form changes
+  // until the person confirms. All last-minute corrections happen in the popup.
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [draft, setDraft] = useState(emptyForm);
+  const [reviewError, setReviewError] = useState("");
+  const dSet = (key) => plainHandler(setDraft, key);
+  const dUpper = (key) => upperHandler(setDraft, key);
+  const dPhone = phoneHandler(setDraft);
 
   const loadSales = useCallback(async () => {
     try {
@@ -127,41 +292,57 @@ export default function SalesEntry() {
     setEditingId(null);
   };
 
-  const validate = () => {
-    if (!form.productId) return t("sales.err.product");
-    if (!form.buyer.trim()) return t("sales.err.buyer");
-    if (!(parseFloat(form.quantity) > 0)) return t("sales.err.quantity");
-    if (!(parseFloat(form.rate) > 0)) return t("sales.err.rate");
-    if (!form.company.trim()) return t("sales.err.company");
-    if (!form.driver.trim()) return t("sales.err.driver");
-    if (!form.truck.trim()) return t("sales.err.truck");
-    if (form.phone.trim()) {
-      let digits = form.phone.replace(/\D/g, "");
-      if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
-      if (digits.length !== 10) return t("sales.err.phone");
-    }
-    if (!form.dispatchDate || form.dispatchDate > todayIso) return t("sales.err.date");
+  const validate = (d) => {
+    if (!d.productId) return t("sales.err.product");
+    if (!d.buyer.trim()) return t("sales.err.buyer");
+    if (!(parseFloat(d.quantity) > 0)) return t("sales.err.quantity");
+    if (!(parseFloat(d.rate) > 0)) return t("sales.err.rate");
+    if (!d.company.trim()) return t("sales.err.company");
+    if (!d.driver.trim()) return t("sales.err.driver");
+    if (!d.truck.trim()) return t("sales.err.truck");
+    if (d.phone && !/^\d{10}$/.test(d.phone)) return t("sales.err.phone");
+    if (!d.dispatchDate || d.dispatchDate > todayIso) return t("sales.err.date");
     return null;
   };
 
-  const handleSubmit = async (e) => {
+  // Step 1: form submit -> validate -> open the review popup. NO API call yet.
+  const openReview = (e) => {
     e.preventDefault();
-    const problem = validate();
+    const problem = validate(form);
     if (problem) {
       toast.error(problem);
       return;
     }
+    setDraft({ ...form });
+    setReviewError("");
+    setReviewOpen(true);
+  };
+
+  const closeReview = () => {
+    if (saving) return;
+    setReviewOpen(false);
+    setReviewError("");
+  };
+
+  // Step 2: confirmed in the popup -> save exactly what the popup shows.
+  const confirmSave = async () => {
+    const problem = validate(draft);
+    if (problem) {
+      setReviewError(problem);
+      return;
+    }
+    setReviewError("");
     const payload = {
-      product_id: form.productId,
-      buyer_name: form.buyer.trim(),
-      dalal_name: form.dalal.trim() || null,
-      quantity: parseFloat(form.quantity),
-      rate: parseFloat(form.rate),
-      transport_company: form.company.trim(),
-      driver_name: form.driver.trim(),
-      driver_phone: form.phone.trim() || null,
-      truck_number: form.truck.trim(),
-      dispatch_date: form.dispatchDate,
+      product_id: draft.productId,
+      buyer_name: draft.buyer.trim(),
+      dalal_name: draft.dalal.trim() || null,
+      quantity: parseFloat(draft.quantity),
+      rate: parseFloat(draft.rate),
+      transport_company: draft.company.trim(),
+      driver_name: draft.driver.trim(),
+      driver_phone: draft.phone || null,
+      truck_number: draft.truck.trim(),
+      dispatch_date: draft.dispatchDate,
     };
     setSaving(true);
     try {
@@ -175,10 +356,11 @@ export default function SalesEntry() {
           action: { label: t("sales.downloadBill"), onClick: () => downloadBill(res.data) },
         });
       }
+      setReviewOpen(false);
       resetForm();
       await Promise.all([loadSales(), loadSuggestions()]);
     } catch (err) {
-      toast.error(formatApiError(err));
+      setReviewError(formatApiError(err)); // stay in the popup so nothing typed is lost
     } finally {
       setSaving(false);
     }
@@ -188,14 +370,14 @@ export default function SalesEntry() {
     setEditingId(s.id);
     setForm({
       productId: s.product_id,
-      buyer: s.buyer_name,
-      dalal: s.dalal_name || "",
+      buyer: s.buyer_name.toUpperCase(),
+      dalal: (s.dalal_name || "").toUpperCase(),
       quantity: String(s.quantity),
       rate: String(s.rate),
-      company: s.transport_company,
-      driver: s.driver_name,
-      phone: s.driver_phone || "",
-      truck: s.truck_number,
+      company: s.transport_company.toUpperCase(),
+      driver: s.driver_name.toUpperCase(),
+      phone: cleanPhone(s.driver_phone),
+      truck: s.truck_number.toUpperCase(),
       dispatchDate: s.dispatch_date,
     });
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -224,16 +406,25 @@ export default function SalesEntry() {
 
   return (
     <div className="space-y-8" data-testid="sales-entry-page">
-      <header className="border-b border-[#E7E5E4] pb-4">
-        <h1 className="text-3xl font-serif text-[#1C1917]" data-testid="sales-title">
-          {t("sales.title")}
-        </h1>
-        <p className="mt-1 text-sm text-stone-500">{t("sales.subtitle")}</p>
+      <header className="border-b border-[#E7E5E4] pb-4 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h1 className="text-3xl font-serif text-[#1C1917]" data-testid="sales-title">
+            {t("sales.title")}
+          </h1>
+          <p className="mt-1 text-sm text-stone-500">{t("sales.subtitle")}</p>
+        </div>
+        <Link
+          to="/sales/companies" data-testid="sales-to-companies"
+          className="inline-flex items-center gap-2 border border-[#D6D3D1] text-[#292524] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#F0EFEA] transition-colors"
+        >
+          <Building2 strokeWidth={1.5} className="w-4 h-4" />
+          {t("nav.salesCompanies")}
+        </Link>
       </header>
 
       {/* ---------- Entry form ---------- */}
       <form
-        onSubmit={handleSubmit}
+        onSubmit={openReview}
         data-testid="sales-form"
         className="bg-white border border-[#E7E5E4] p-6 space-y-6"
       >
@@ -241,122 +432,11 @@ export default function SalesEntry() {
           {editingId ? t("sales.editSale") : t("sales.newSale")}
         </h2>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <Field label={t("sales.product")} required>
-            <select
-              value={form.productId}
-              onChange={set("productId")}
-              data-testid="sales-product-select"
-              className={inputCls}
-            >
-              <option value="">{t("sales.selectProduct")}</option>
-              {products.map((p) => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-          </Field>
-
-          <Field label={t("sales.buyer")} required>
-            <input
-              type="text" list="sales-buyers" value={form.buyer} onChange={set("buyer")}
-              placeholder={t("sales.buyerPh")} data-testid="sales-buyer-input"
-              className={inputCls} maxLength={120}
-            />
-            <datalist id="sales-buyers">
-              {suggest.buyers.map((b) => <option key={b} value={b} />)}
-            </datalist>
-          </Field>
-
-          <Field label={t("sales.dalal")} optional={t("sales.dalalOptional")}>
-            <input
-              type="text" list="sales-dalals" value={form.dalal} onChange={set("dalal")}
-              placeholder={t("sales.dalalPh")} data-testid="sales-dalal-input"
-              className={inputCls} maxLength={120}
-            />
-            <datalist id="sales-dalals">
-              {suggest.dalals.map((d) => <option key={d} value={d} />)}
-            </datalist>
-          </Field>
-
-          <div className="hidden md:block" />
-
-          <Field label={t("sales.quantity")} required>
-            <input
-              type="number" step="0.01" min="0" inputMode="decimal"
-              value={form.quantity} onChange={set("quantity")}
-              placeholder={t("sales.quantityPh")} data-testid="sales-quantity-input"
-              className={`${inputCls} font-mono`}
-            />
-          </Field>
-
-          <Field label={t("sales.rate")} required>
-            <input
-              type="number" step="0.01" min="0" inputMode="decimal"
-              value={form.rate} onChange={set("rate")}
-              placeholder={t("sales.ratePh")} data-testid="sales-rate-input"
-              className={`${inputCls} font-mono`}
-            />
-          </Field>
-        </div>
-
-        <div
-          className="flex items-center justify-between bg-[#FBF1DE] border border-[#F0DDB4] px-5 py-4"
-          data-testid="sales-amount-box"
-        >
-          <span className="text-sm font-medium text-[#92400E]">{t("sales.amount")}:</span>
-          <span className="font-mono text-2xl text-[#92400E]" data-testid="sales-total-amount">
-            {totalAmount === null ? "₹ —" : formatCurrency(totalAmount)}
-          </span>
-        </div>
-
-        {/* ---------- Transport ---------- */}
-        <div className="pt-5 border-t border-[#E7E5E4] space-y-5">
-          <h3 className="text-xs uppercase tracking-widest text-stone-600 font-semibold">
-            {t("sales.transport")}
-          </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-            <Field label={t("sales.company")} required>
-              <input
-                type="text" list="sales-companies" value={form.company} onChange={set("company")}
-                placeholder={t("sales.companyPh")} data-testid="sales-company-input"
-                className={inputCls} maxLength={120}
-              />
-              <datalist id="sales-companies">
-                {suggest.transport_companies.map((c) => <option key={c} value={c} />)}
-              </datalist>
-            </Field>
-            <Field label={t("sales.driver")} required>
-              <input
-                type="text" value={form.driver} onChange={set("driver")}
-                placeholder={t("sales.driverPh")} data-testid="sales-driver-input"
-                className={inputCls} maxLength={120}
-              />
-            </Field>
-            <Field label={t("sales.phone")}>
-              <input
-                type="tel" inputMode="tel" value={form.phone} onChange={set("phone")}
-                placeholder={t("sales.phonePh")} data-testid="sales-phone-input"
-                className={`${inputCls} font-mono`} maxLength={16}
-              />
-            </Field>
-            <Field label={t("sales.truck")} required className="md:col-span-2">
-              <input
-                type="text" value={form.truck} onChange={set("truck")}
-                placeholder={t("sales.truckPh")} data-testid="sales-truck-input"
-                className={`${inputCls} font-mono uppercase placeholder:normal-case`} maxLength={20}
-              />
-            </Field>
-            <Field
-              label={t("sales.dispatchDate")} required
-            >
-              <input
-                type="date" value={form.dispatchDate} onChange={set("dispatchDate")}
-                max={todayIso} data-testid="sales-date-input"
-                className={`${inputCls} font-mono`}
-              />
-            </Field>
-          </div>
-        </div>
+        <SaleFields
+          v={form} onText={set} onUpper={setUpper} onPhone={onPhone}
+          products={products} suggest={suggest} todayIso={todayIso} t={t}
+          idp="sales" tp="sales-"
+        />
 
         <div className="bg-[#F0EFEA] px-4 py-3 text-sm text-stone-600" data-testid="sales-entered-by">
           {t("sales.enteredBy")}: <strong className="text-[#1C1917]">{user?.name}</strong>
@@ -364,11 +444,11 @@ export default function SalesEntry() {
 
         <div className="flex flex-wrap items-center gap-3">
           <button
-            type="submit" disabled={saving} data-testid="sales-save-btn"
-            className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-6 py-3 text-sm uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-50 transition-colors"
+            type="submit" data-testid="sales-save-btn"
+            className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-6 py-3 text-sm uppercase tracking-widest hover:bg-[#92400E] transition-colors"
           >
             <Save strokeWidth={1.5} className="w-4 h-4" />
-            {saving ? t("sales.saving") : editingId ? t("sales.update") : t("sales.save")}
+            {editingId ? t("sales.update") : t("sales.save")}
           </button>
           <button
             type="button" onClick={resetForm} data-testid="sales-clear-btn"
@@ -473,6 +553,56 @@ export default function SalesEntry() {
           )}
         </div>
       </section>
+
+      {/* ---------- Review popup: confirm everything, and fix anything here ---------- */}
+      <Dialog open={reviewOpen} onOpenChange={(open) => { if (!open) closeReview(); }}>
+        <DialogContent
+          className="bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm max-w-3xl max-h-[92vh] overflow-y-auto"
+          data-testid="sales-review-dialog"
+        >
+          <DialogHeader>
+            <DialogTitle className="text-2xl font-serif text-[#1C1917]">
+              {editingId ? t("sales.reviewTitleEdit") : t("sales.reviewTitle")}
+            </DialogTitle>
+            <DialogDescription className="text-sm text-stone-500">
+              {t("sales.reviewDesc")}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-6">
+            <SaleFields
+              v={draft} onText={dSet} onUpper={dUpper} onPhone={dPhone}
+              products={products} suggest={suggest} todayIso={todayIso} t={t}
+              idp="review" tp="review-"
+            />
+            <div className="bg-[#F0EFEA] px-4 py-3 text-sm text-stone-600">
+              {t("sales.enteredBy")}: <strong className="text-[#1C1917]">{user?.name}</strong>
+            </div>
+          </div>
+
+          {reviewError && (
+            <p role="alert" className="text-sm text-red-700" data-testid="sales-review-error">
+              {reviewError}
+            </p>
+          )}
+
+          <DialogFooter className="gap-2 pt-2">
+            <button
+              type="button" onClick={closeReview} disabled={saving} data-testid="sales-review-cancel-btn"
+              className="border border-[#D6D3D1] text-[#292524] px-5 py-2.5 text-sm uppercase tracking-widest hover:bg-[#F0EFEA] disabled:opacity-60"
+            >
+              {t("sales.cancelReview")}
+            </button>
+            <button
+              type="button" onClick={confirmSave} disabled={saving} data-testid="sales-review-confirm-btn"
+              className="bg-[#B45309] text-[#FAFAF9] px-5 py-2.5 text-sm uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-60 inline-flex items-center justify-center gap-2"
+            >
+              <Check strokeWidth={1.5} className="w-4 h-4" />
+              {saving ? t("sales.saving") : editingId ? t("sales.confirmUpdate") : t("sales.confirmSave")}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
