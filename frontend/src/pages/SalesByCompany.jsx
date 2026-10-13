@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
-  Building2, ArrowLeft, Download, FileText, Plus, Trash2, Search, Check,
+  Building2, ArrowLeft, Download, FileText, Plus, Trash2, Search, Check, Undo2,
 } from "lucide-react";
 import { toast } from "sonner";
 import api, { formatCurrency, formatDate, formatApiError } from "@/lib/api";
@@ -68,6 +68,13 @@ export default function SalesByCompany() {
   const [pay, setPay] = useState({ date: todayIso, amount: "", mode: "cash", note: "" });
   const [payError, setPayError] = useState("");
   const [paySaving, setPaySaving] = useState(false);
+
+  // truck settlement popup
+  const [settleOpen, setSettleOpen] = useState(false);
+  const [settleRow, setSettleRow] = useState(null);
+  const [settle, setSettle] = useState({ date: todayIso, cut: "", paid: "" });
+  const [settleError, setSettleError] = useState("");
+  const [settleSaving, setSettleSaving] = useState(false);
 
   const loadCompanies = useCallback(async () => {
     try {
@@ -196,6 +203,65 @@ export default function SalesByCompany() {
     try {
       await api.delete(`/sales/payments/${row.id}`);
       toast.success(t("sc.paymentDeleted"));
+      await Promise.all([loadStatement(), loadCompanies()]);
+    } catch (err) {
+      toast.error(formatApiError(err));
+    }
+  };
+
+  // ---------- truck settlement ----------
+  const round2 = (n) => Math.round(n * 100) / 100;
+  const unassigned = Math.max(statement?.summary?.unassigned || 0, 0);
+
+  const openSettle = (row) => {
+    const paid = Math.max(0, Math.min(row.due, unassigned));
+    setSettleRow(row);
+    setSettle({ date: todayIso, cut: "", paid: paid ? String(round2(paid)) : "" });
+    setSettleError("");
+    setSettleOpen(true);
+  };
+
+  // typing the cut re-fills "paid" = truck due − cut (limited to money available)
+  const changeCut = (value) => {
+    const cut = parseFloat(value) || 0;
+    const paid = Math.max(0, Math.min((settleRow?.due || 0) - cut, unassigned));
+    setSettle((s) => ({ ...s, cut: value, paid: paid ? String(round2(paid)) : "" }));
+  };
+
+  const saveSettle = async () => {
+    const paid = parseFloat(settle.paid) || 0;
+    const cut = parseFloat(settle.cut) || 0;
+    if (paid + cut <= 0) { setSettleError(t("sc.settleNeed")); return; }
+    if (!settle.date || settle.date > todayIso) { setSettleError(t("sales.err.date")); return; }
+    setSettleError("");
+    setSettleSaving(true);
+    try {
+      await api.post("/sales/settlements", { sale_id: settleRow.id, paid, cut, date: settle.date });
+      toast.success(t("sc.settleSaved"));
+      setSettleOpen(false);
+      await Promise.all([loadStatement(), loadCompanies()]);
+    } catch (err) {
+      setSettleError(formatApiError(err)); // stay open so nothing typed is lost
+    } finally {
+      setSettleSaving(false);
+    }
+  };
+
+  const undoSettle = async (row) => {
+    if (!window.confirm(t("sc.confirmUndo"))) return;
+    try {
+      await api.delete(`/sales/settlements/by-sale/${row.id}`);
+      toast.success(t("sc.undone"));
+      await Promise.all([loadStatement(), loadCompanies()]);
+    } catch (err) {
+      toast.error(formatApiError(err));
+    }
+  };
+
+  const autoSettle = async () => {
+    try {
+      const r = await api.post("/sales/companies/auto-settle", { buyer_name: company });
+      toast.success(`${t("sc.autoDone")} ${r.data.trucks}`);
       await Promise.all([loadStatement(), loadCompanies()]);
     } catch (err) {
       toast.error(formatApiError(err));
@@ -356,7 +422,7 @@ export default function SalesByCompany() {
       {statement && (
         <>
           {/* summary cards */}
-          <div className={`grid grid-cols-2 ${withPayments ? "md:grid-cols-4" : "md:grid-cols-2"} gap-px bg-[#E7E5E4] border border-[#E7E5E4]`}>
+          <div className={`grid grid-cols-2 ${withPayments ? "md:grid-cols-5" : "md:grid-cols-2"} gap-px bg-[#E7E5E4] border border-[#E7E5E4]`}>
             <div className="bg-white px-4 py-3" data-testid="sc-card-sold">
               <div className="text-[10px] uppercase tracking-widest text-stone-500">{t("sc.totalSold")}</div>
               <div className="mt-1 font-mono text-lg text-[#1C1917]">{formatCurrency(totals.sales_amount)}</div>
@@ -373,6 +439,10 @@ export default function SalesByCompany() {
                   <div className="text-[10px] uppercase tracking-widest text-stone-500">{t("sc.received")}</div>
                   <div className="mt-1 font-mono text-lg text-emerald-700">{formatCurrency(totals.payments_total)}</div>
                 </div>
+                <div className="bg-white px-4 py-3" data-testid="sc-card-cuts">
+                  <div className="text-[10px] uppercase tracking-widest text-stone-500">{t("sc.cuts")}</div>
+                  <div className="mt-1 font-mono text-lg text-[#B45309]">{formatCurrency(totals.cuts_total)}</div>
+                </div>
                 <div className="bg-white px-4 py-3" data-testid="sc-card-balance">
                   <div className="text-[10px] uppercase tracking-widest text-stone-500">{t("sc.balanceDue")}</div>
                   <div className={`mt-1 font-mono text-lg ${balanceClass(totals.closing_balance)}`}>
@@ -383,6 +453,19 @@ export default function SalesByCompany() {
             )}
           </div>
           {!withPayments && <p className="text-xs text-stone-500">{t("sc.productFilterNote")}</p>}
+
+          {/* received money still waiting to be assigned to trucks */}
+          {unassigned > 0.01 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border border-emerald-200 bg-emerald-50/60 px-4 py-3" data-testid="sc-unassigned">
+              <div className="text-sm text-stone-700">
+                {t("sc.notAssigned")}:{" "}
+                <span className="font-mono text-lg text-emerald-700">{formatCurrency(unassigned)}</span>
+              </div>
+              <button type="button" onClick={autoSettle} data-testid="sc-auto-settle" className={smallBtn}>
+                <Check strokeWidth={1.5} className="w-4 h-4" />{t("sc.autoSettle")}
+              </button>
+            </div>
+          )}
 
           {/* statement table */}
           <div className="bg-white border border-[#E7E5E4] overflow-x-auto">
@@ -399,11 +482,13 @@ export default function SalesByCompany() {
                     <th className="px-3 py-3 font-medium text-right">{t("sales.colRate")}</th>
                     <th className="px-3 py-3 font-medium text-right">{t("sales.colAmount")}</th>
                     {withPayments && <th className="px-3 py-3 font-medium text-right">{t("sc.colReceived")}</th>}
+                    {withPayments && <th className="px-3 py-3 font-medium text-right">{t("sc.colCut")}</th>}
                     {withPayments && <th className="px-3 py-3 font-medium text-right">{t("sc.colBalance")}</th>}
                     <th className="px-3 py-3 font-medium">{t("sales.colDalal")}</th>
                     <th className="px-3 py-3 font-medium">{t("sales.colTruck")}</th>
                     <th className="px-3 py-3 font-medium">{t("sales.colDriver")}</th>
                     <th className="px-3 py-3 font-medium">{t("sales.colTransport")}</th>
+                    <th className="px-3 py-3 font-medium">{t("sc.colSettle")}</th>
                     <th className="px-3 py-3" />
                   </tr>
                 </thead>
@@ -413,10 +498,11 @@ export default function SalesByCompany() {
                       <td className="px-3 py-3 font-mono whitespace-nowrap">{formatDate(filters.from)}</td>
                       <td className="px-3 py-3 font-medium" colSpan={5}>{t("sc.opening")}</td>
                       <td />
+                      <td />
                       <td className={`px-3 py-3 font-mono text-right ${balanceClass(statement.opening_balance)}`}>
                         {formatCurrency(statement.opening_balance)}
                       </td>
-                      <td colSpan={5} />
+                      <td colSpan={6} />
                     </tr>
                   )}
                   {statement.rows.map((r) =>
@@ -429,6 +515,7 @@ export default function SalesByCompany() {
                         <td className="px-3 py-3 font-mono text-right">{formatCurrency(r.rate)}</td>
                         <td className="px-3 py-3 font-mono text-right font-medium">{formatCurrency(r.amount)}</td>
                         {withPayments && <td />}
+                        {withPayments && <td />}
                         {withPayments && <td className={`px-3 py-3 font-mono text-right ${balanceClass(r.running_balance)}`}>{formatCurrency(r.running_balance)}</td>}
                         <td className="px-3 py-3 text-stone-600">{r.dalal_name || "—"}</td>
                         <td className="px-3 py-3 font-mono whitespace-nowrap">{r.truck_number}</td>
@@ -437,6 +524,37 @@ export default function SalesByCompany() {
                           {r.driver_phone && <div className="text-xs font-mono text-stone-500">{r.driver_phone}</div>}
                         </td>
                         <td className="px-3 py-3">{r.transport_company}</td>
+                        <td className="px-3 py-3 whitespace-nowrap" data-testid={`sc-status-${r.id}`}>
+                          {r.status === "settled" && (
+                            <div className="text-xs font-semibold text-emerald-700">
+                              {t("sc.settled")}
+                              {r.settled_cut > 0 && (
+                                <span className="font-normal text-stone-500"> · {t("sc.cutWord")} {formatCurrency(r.settled_cut)}</span>
+                              )}
+                            </div>
+                          )}
+                          {r.status === "part" && (
+                            <div className="text-xs font-semibold text-[#B45309]">
+                              {t("sc.partSettled")}
+                              <span className="font-normal text-stone-500"> · {formatCurrency(r.due)} {t("sc.dueLeft")}</span>
+                            </div>
+                          )}
+                          {r.status === "due" && <div className="text-xs text-stone-500">{t("sc.dueStatus")}</div>}
+                          <div className="mt-1 flex items-center gap-2">
+                            {r.status !== "settled" && (
+                              <button type="button" onClick={() => openSettle(r)} data-testid={`sc-settle-${r.id}`}
+                                className="inline-flex items-center gap-1 border border-[#B45309] text-[#B45309] px-2 py-1 text-[10px] uppercase tracking-widest hover:bg-[#B45309] hover:text-[#FAFAF9] transition-colors">
+                                <Check strokeWidth={1.5} className="w-3 h-3" />{t("sc.settle")}
+                              </button>
+                            )}
+                            {(r.settled_paid > 0 || r.settled_cut > 0) && (
+                              <button type="button" onClick={() => undoSettle(r)} data-testid={`sc-undo-${r.id}`}
+                                className="inline-flex items-center gap-1 text-[10px] uppercase tracking-widest text-stone-500 hover:text-red-700">
+                                <Undo2 strokeWidth={1.5} className="w-3 h-3" />{t("sc.undo")}
+                              </button>
+                            )}
+                          </div>
+                        </td>
                         <td className="px-3 py-3 whitespace-nowrap">
                           <button type="button" onClick={() => downloadBill(r)} data-testid={`sc-bill-${r.id}`}
                             className="p-1.5 text-stone-500 hover:text-[#B45309]" title={t("sales.downloadBill")} aria-label={t("sales.downloadBill")}>
@@ -444,7 +562,7 @@ export default function SalesByCompany() {
                           </button>
                         </td>
                       </tr>
-                    ) : (
+                    ) : r.type === "payment" ? (
                       <tr key={`pay-${r.id}`} className="border-b border-[#F0EFEA] bg-emerald-50/60 align-top" data-testid={`sc-payment-${r.id}`}>
                         <td className="px-3 py-3 font-mono whitespace-nowrap">{formatDate(r.date)}</td>
                         <td className="px-3 py-3 text-xs font-semibold tracking-wide whitespace-nowrap" colSpan={2}>
@@ -452,14 +570,28 @@ export default function SalesByCompany() {
                         </td>
                         <td colSpan={3} />
                         <td className="px-3 py-3 font-mono text-right font-medium text-emerald-700">{formatCurrency(r.amount)}</td>
+                        <td />
                         <td className={`px-3 py-3 font-mono text-right ${balanceClass(r.running_balance)}`}>{formatCurrency(r.running_balance)}</td>
-                        <td className="px-3 py-3 text-stone-600" colSpan={4}>{r.note || ""}</td>
+                        <td className="px-3 py-3 text-stone-600" colSpan={5}>{r.note || ""}</td>
                         <td className="px-3 py-3 whitespace-nowrap">
                           <button type="button" onClick={() => deletePayment(r)} data-testid={`sc-del-payment-${r.id}`}
                             className="p-1.5 text-stone-500 hover:text-red-700" aria-label="Delete payment">
                             <Trash2 strokeWidth={1.5} className="w-4 h-4" />
                           </button>
                         </td>
+                      </tr>
+                    ) : (
+                      <tr key={`cut-${r.id}`} className="border-b border-[#F0EFEA] bg-amber-50/70 align-top" data-testid={`sc-cut-${r.id}`}>
+                        <td className="px-3 py-3 font-mono whitespace-nowrap">{formatDate(r.date)}</td>
+                        <td className="px-3 py-3 text-xs font-semibold tracking-wide whitespace-nowrap" colSpan={2}>
+                          {t("sc.cutRow")} · {r.truck_number}
+                        </td>
+                        <td colSpan={3} />
+                        <td />
+                        <td className="px-3 py-3 font-mono text-right font-medium text-[#B45309]">{formatCurrency(r.amount)}</td>
+                        <td className={`px-3 py-3 font-mono text-right ${balanceClass(r.running_balance)}`}>{formatCurrency(r.running_balance)}</td>
+                        <td className="px-3 py-3 text-stone-600" colSpan={5}>{r.note || ""}</td>
+                        <td />
                       </tr>
                     )
                   )}
@@ -473,8 +605,9 @@ export default function SalesByCompany() {
                     <td className="px-3 py-3 font-mono text-right">{totals.avg_rate ? formatCurrency(totals.avg_rate) : "—"}</td>
                     <td className="px-3 py-3 font-mono text-right">{formatCurrency(totals.sales_amount)}</td>
                     {withPayments && <td className="px-3 py-3 font-mono text-right text-emerald-700">{formatCurrency(totals.payments_total)}</td>}
+                    {withPayments && <td className="px-3 py-3 font-mono text-right text-[#B45309]">{formatCurrency(totals.cuts_total)}</td>}
                     {withPayments && <td className={`px-3 py-3 font-mono text-right ${balanceClass(totals.closing_balance)}`}>{formatCurrency(totals.closing_balance)}</td>}
-                    <td colSpan={5} />
+                    <td colSpan={6} />
                   </tr>
                 </tfoot>
               </table>
@@ -513,6 +646,65 @@ export default function SalesByCompany() {
         </>
       )}
       {loading && !statement && <p className="text-sm text-stone-500">…</p>}
+
+      {/* ---------- Settle truck popup ---------- */}
+      <Dialog open={settleOpen} onOpenChange={(open) => { if (!open && !settleSaving) setSettleOpen(false); }}>
+        <DialogContent className="bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm max-w-md" data-testid="sc-settle-dialog">
+          <DialogHeader>
+            <DialogTitle className="text-2xl font-serif text-[#1C1917]">{t("sc.settleTitle")}</DialogTitle>
+            <DialogDescription className="text-sm text-stone-600">{t("sc.settleDesc")}</DialogDescription>
+          </DialogHeader>
+          {settleRow && (
+            <div className="space-y-4">
+              <div className="bg-white border border-[#E7E5E4] px-4 py-3 text-sm">
+                <div className="font-mono font-medium text-[#1C1917]">
+                  {settleRow.truck_number}{settleRow.bill_no ? ` · ${settleRow.bill_no}` : ""}
+                </div>
+                <div className="mt-1 text-stone-600">
+                  {t("sc.truckDue")}: <span className="font-mono text-[#B45309]">{formatCurrency(settleRow.due)}</span>
+                </div>
+                <div className="text-stone-600">
+                  {t("sc.availableMoney")}: <span className="font-mono text-emerald-700">{formatCurrency(unassigned)}</span>
+                </div>
+              </div>
+              <label className="block text-[11px] uppercase tracking-widest text-stone-500">
+                {t("sc.cutAmount")} <span className="normal-case tracking-normal text-stone-400">({t("sc.cutOptional")})</span>
+                <input
+                  type="number" inputMode="decimal" min="0" step="any" value={settle.cut}
+                  onChange={(e) => changeCut(e.target.value)} className={inputCls} data-testid="sc-settle-cut"
+                />
+              </label>
+              <label className="block text-[11px] uppercase tracking-widest text-stone-500">
+                {t("sc.paidAmount")}
+                <input
+                  type="number" inputMode="decimal" min="0" step="any" value={settle.paid}
+                  onChange={(e) => setSettle((s) => ({ ...s, paid: e.target.value }))} className={inputCls} data-testid="sc-settle-paid"
+                />
+              </label>
+              <label className="block text-[11px] uppercase tracking-widest text-stone-500">
+                {t("sc.settleDate")}
+                <input
+                  type="date" max={todayIso} value={settle.date}
+                  onChange={(e) => setSettle((s) => ({ ...s, date: e.target.value }))} className={inputCls} data-testid="sc-settle-date"
+                />
+              </label>
+            </div>
+          )}
+          {settleError && <p role="alert" className="text-sm text-red-700" data-testid="sc-settle-error">{settleError}</p>}
+          <DialogFooter className="gap-2">
+            <button type="button" onClick={() => setSettleOpen(false)} disabled={settleSaving} className={smallBtn} data-testid="sc-settle-cancel">
+              {t("sales.cancelReview")}
+            </button>
+            <button
+              type="button" onClick={saveSettle} disabled={settleSaving} data-testid="sc-settle-save"
+              className="inline-flex items-center gap-2 bg-[#B45309] text-[#FAFAF9] px-4 py-2.5 text-xs uppercase tracking-widest hover:bg-[#92400E] disabled:opacity-40 transition-colors"
+            >
+              <Check strokeWidth={1.5} className="w-4 h-4" />
+              {settleSaving ? t("sales.saving") : t("sc.settleSave")}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ---------- Add payment popup ---------- */}
       <Dialog open={payOpen} onOpenChange={(open) => { if (!open && !paySaving) setPayOpen(false); }}>
