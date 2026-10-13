@@ -19,6 +19,7 @@ const ClientSubledger = lazy(() => import("@/pages/ClientSubledger"));
 const ProductLedger = lazy(() => import("@/pages/ProductLedger"));
 const ProcurementSettlement = lazy(() => import("@/pages/ProcurementSettlement"));
 const SalesEntry = lazy(() => import("@/pages/SalesEntry"));
+const SalesByCompany = lazy(() => import("@/pages/SalesByCompany"));
 const BackupRestore = lazy(() => import("@/pages/BackupRestore"));
 
 function RouteFallback() {
@@ -50,6 +51,7 @@ function App() {
                   <Route path="procurement/product-ledger" element={<ProductLedger />} />
                   <Route path="procurement/settlement" element={<ProcurementSettlement />} />
                   <Route path="sales" element={<SalesEntry />} />
+                  <Route path="sales/companies" element={<SalesByCompany />} />
                   <Route path="admin/backup" element={<BackupRestore />} />
                 </Route>
                 <Route path="*" element={<Navigate to="/" replace />} />
