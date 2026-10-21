@@ -65,10 +65,23 @@ const phoneHandler = (setter) => (e) =>
  * All editable sale fields. Rendered twice: in the main form and inside the
  * review popup (where the last corrections are made before saving).
  */
-function SaleFields({ v, onText, onUpper, onPhone, products, suggest, todayIso, t, idp, tp }) {
+function SaleFields({ v, onText, onUpper, onPhone, products, suggest, todayIso, t, idp, tp, editingBuyer, setProduct }) {
   const q = parseFloat(v.quantity);
   const r = parseFloat(v.rate);
   const totalAmount = isNaN(q) || isNaN(r) ? null : +(q * r).toFixed(2);
+
+  // One grain per company: a known company can only be sold its own grain.
+  const buyerKey = v.buyer.trim().replace(/\s+/g, " ").toUpperCase();
+  const known = (suggest.buyer_products || {})[buyerKey] || [];
+  // the only truck of a company may still change grain while being edited
+  const freeForEdit = !!editingBuyer && editingBuyer === buyerKey && ((suggest.buyer_trucks || {})[buyerKey] || 0) <= 1;
+  const allowed = freeForEdit ? [] : known;
+  const lockedProductId = allowed.length === 1 ? allowed[0].product_id : null;
+  const productOptions = allowed.length > 0 ? products.filter((p) => allowed.some((a) => a.product_id === p.id)) : products;
+  useEffect(() => {
+    if (lockedProductId && v.productId !== lockedProductId) setProduct(lockedProductId);
+  }, [lockedProductId, v.productId, setProduct]);
+
   return (
     <>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
@@ -76,14 +89,20 @@ function SaleFields({ v, onText, onUpper, onPhone, products, suggest, todayIso, 
           <select
             value={v.productId}
             onChange={onText("productId")}
+            disabled={!!lockedProductId}
             data-testid={`${tp}product-select`}
             className={inputCls}
           >
             <option value="">{t("sales.selectProduct")}</option>
-            {products.map((p) => (
+            {productOptions.map((p) => (
               <option key={p.id} value={p.id}>{p.name}</option>
             ))}
           </select>
+          {lockedProductId && (
+            <p className="mt-1 text-xs text-[#B45309]" data-testid={`${tp}grain-locked`}>
+              {t("sales.grainLocked").replace("{company}", buyerKey).replace("{grain}", allowed[0].product_name)}
+            </p>
+          )}
         </Field>
 
         <Field label={t("sales.buyer")} required>
@@ -223,6 +242,7 @@ export default function SalesEntry() {
   const [suggest, setSuggest] = useState({ buyers: [], dalals: [], transport_companies: [] });
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState(null);
+  const [editingBuyer, setEditingBuyer] = useState(null); // company of the sale being edited
   const [saving, setSaving] = useState(false);
   const [filterDate, setFilterDate] = useState(""); // "" = last 30 days
 
@@ -290,6 +310,7 @@ export default function SalesEntry() {
   const resetForm = () => {
     setForm({ ...emptyForm, dispatchDate: todayIso });
     setEditingId(null);
+    setEditingBuyer(null);
   };
 
   const validate = (d) => {
@@ -368,6 +389,7 @@ export default function SalesEntry() {
 
   const startEdit = (s) => {
     setEditingId(s.id);
+    setEditingBuyer(s.buyer_name.trim().replace(/\s+/g, " ").toUpperCase());
     setForm({
       productId: s.product_id,
       buyer: s.buyer_name.toUpperCase(),
@@ -435,6 +457,7 @@ export default function SalesEntry() {
         <SaleFields
           v={form} onText={set} onUpper={setUpper} onPhone={onPhone}
           products={products} suggest={suggest} todayIso={todayIso} t={t}
+          editingBuyer={editingBuyer} setProduct={(id) => setForm((f) => ({ ...f, productId: id }))}
           idp="sales" tp="sales-"
         />
 
@@ -573,6 +596,7 @@ export default function SalesEntry() {
             <SaleFields
               v={draft} onText={dSet} onUpper={dUpper} onPhone={dPhone}
               products={products} suggest={suggest} todayIso={todayIso} t={t}
+              editingBuyer={editingBuyer} setProduct={(id) => setDraft((d) => ({ ...d, productId: id }))}
               idp="review" tp="review-"
             />
             <div className="bg-[#F0EFEA] px-4 py-3 text-sm text-stone-600">
