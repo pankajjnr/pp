@@ -1965,7 +1965,7 @@ def _normalize_phone(value: Optional[str]) -> Optional[str]:
     return v
 
 
-async def _build_sale_doc(payload: SaleBase) -> dict:
+async def _build_sale_doc(payload: SaleBase, exclude_id: Optional[str] = None) -> dict:
     try:
         d = datetime.strptime(payload.dispatch_date, "%Y-%m-%d").date()
     except ValueError:
@@ -1983,6 +1983,19 @@ async def _build_sale_doc(payload: SaleBase) -> dict:
     truck = _normalize_truck(payload.truck_number)
     if not (buyer and company and driver and truck):
         raise HTTPException(status_code=400, detail="Required fields cannot be blank")
+
+    # One grain per company: a company can only be sold the grain(s) it already
+    # has (older data with several grains keeps working). A brand-new company
+    # takes whatever grain its first truck has. The sale being edited is ignored,
+    # so the only truck of a company can still change grain.
+    others = await db.sales_entries.find(
+        {"buyer_name": {"$in": await _buyer_variants(_norm_name(buyer))}},
+        {"_id": 0, "id": 1, "product_id": 1, "product_name": 1},
+    ).to_list(None)
+    allowed = {o["product_id"]: o.get("product_name") for o in others if o["id"] != exclude_id}
+    if allowed and p["id"] not in allowed:
+        names = ", ".join(sorted({str(n) for n in allowed.values() if n}))
+        raise HTTPException(status_code=400, detail=f"{buyer} buys only {names}. A company can be sold only one grain.")
 
     return {
         "product_id": p["id"],
@@ -2064,10 +2077,25 @@ async def sale_suggestions(_user: dict = Depends(get_current_user)):
         # Upper-case + de-duplicate, so older mixed-case entries show once.
         return sorted({" ".join(v.split()).upper() for v in vals if v and v.strip()})
 
+    rows = await db.sales_entries.find(
+        {}, {"_id": 0, "buyer_name": 1, "product_id": 1, "product_name": 1}
+    ).to_list(None)
+    grains: dict = {}
+    trucks: dict = {}
+    for r in rows:
+        k = _norm_name(r.get("buyer_name"))
+        if not k:
+            continue
+        grains.setdefault(k, {})[r["product_id"]] = r.get("product_name")
+        trucks[k] = trucks.get(k, 0) + 1
     return {
         "buyers": await distinct("buyer_name"),
         "dalals": await distinct("dalal_name"),
         "transport_companies": await distinct("transport_company"),
+        "buyer_products": {
+            k: [{"product_id": i, "product_name": n} for i, n in v.items()] for k, v in grains.items()
+        },
+        "buyer_trucks": trucks,
     }
 
 
@@ -2076,7 +2104,7 @@ async def update_sale(sale_id: str, payload: SaleCreate, _user: dict = Depends(g
     existing = await db.sales_entries.find_one({"id": sale_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Sale not found")
-    changes = await _build_sale_doc(payload)
+    changes = await _build_sale_doc(payload, exclude_id=sale_id)
     await db.sales_entries.update_one({"id": sale_id}, {"$set": changes})
     existing.update(changes)
     return SaleOut(**existing)
@@ -2528,11 +2556,43 @@ async def auto_settle_company(payload: AutoSettleRequest, user: dict = Depends(g
     return {"ok": True, "trucks": done, "assigned": round(assigned, 2), "unassigned": max(left, 0.0)}
 
 
+@api_router.get("/sales/payments/by-date")
+async def sale_payments_by_date(date_str: str, _user: dict = Depends(get_current_user)):
+    """Payments received from sales companies on one day (for the Dashboard)."""
+    _check_ymd(date_str, "date_str")
+    pays = await db.sale_payments.find({"payment_date": date_str}, {"_id": 0}).to_list(None)
+    pays.sort(key=lambda p: p.get("created_at", ""), reverse=True)
+    rows = await db.sales_entries.find({}, {"_id": 0, "buyer_name": 1, "product_name": 1}).to_list(None)
+    grains: dict = {}
+    for r in rows:
+        if r.get("product_name"):
+            grains.setdefault(_norm_name(r.get("buyer_name")), set()).add(r["product_name"])
+    return [
+        {
+            "id": p["id"], "buyer_name": p["buyer_name"], "amount": float(p["amount"]),
+            "mode": p.get("mode"), "note": p.get("note"), "payment_date": p["payment_date"],
+            "created_at": p.get("created_at", ""), "entered_by": p.get("entered_by"),
+            "product_names": sorted(grains.get(_norm_name(p["buyer_name"]), [])),
+        }
+        for p in pays
+    ]
+
+
+@api_router.get("/sales/dashboard-summary")
+async def sales_dashboard_summary(user: dict = Depends(get_current_user)):
+    """Total still due from all sales companies (after payments and cuts)."""
+    companies = await list_sale_companies(user)
+    return {
+        "due_total": round(sum(c["balance"] for c in companies), 2),
+        "companies_with_due": sum(1 for c in companies if c["balance"] > SETTLE_EPS),
+    }
+
+
 @api_router.get("/sales/companies")
 async def list_sale_companies(_user: dict = Depends(get_current_user)):
     """One row per company: trucks, quantity, sold, received, balance, last dates."""
     sales = await db.sales_entries.find(
-        {}, {"_id": 0, "id": 1, "buyer_name": 1, "quantity": 1, "total_amount": 1, "dispatch_date": 1}
+        {}, {"_id": 0, "id": 1, "buyer_name": 1, "product_name": 1, "quantity": 1, "total_amount": 1, "dispatch_date": 1}
     ).to_list(None)
     pays = await db.sale_payments.find(
         {}, {"_id": 0, "buyer_name": 1, "amount": 1, "payment_date": 1}
@@ -2546,8 +2606,11 @@ async def list_sale_companies(_user: dict = Depends(get_current_user)):
         if not key:
             continue
         a = agg.setdefault(key, {"buyer_name": key, "trucks": 0, "total_quantity": 0.0, "total_amount": 0.0,
-                                 "total_paid": 0.0, "total_cuts": 0.0, "last_sale_date": None, "last_payment_date": None})
+                                 "total_paid": 0.0, "total_cuts": 0.0, "last_sale_date": None, "last_payment_date": None,
+                                 "_prods": set()})
         a["trucks"] += 1
+        if s.get("product_name"):
+            a["_prods"].add(s["product_name"])
         a["total_quantity"] += float(s.get("quantity", 0))
         a["total_amount"] += float(s.get("total_amount", 0))
         d = s.get("dispatch_date")
@@ -2569,6 +2632,7 @@ async def list_sale_companies(_user: dict = Depends(get_current_user)):
 
     out = []
     for a in agg.values():
+        a["product_names"] = sorted(a.pop("_prods"))
         a["total_cuts"] = round(a["total_cuts"], 2)
         a["total_quantity"] = round(a["total_quantity"], 2)
         a["total_amount"] = round(a["total_amount"], 2)
@@ -2685,6 +2749,7 @@ async def _build_statement(
 
     return {
         "buyer_name": norm,
+        "product_names": sorted({x.get("product_name") for x in money_state["sales"] if x.get("product_name")}),
         "from_date": from_date,
         "to_date": to_date,
         "product_id": product_id,
