@@ -308,6 +308,7 @@ export default function SalesByCompany() {
               <thead>
                 <tr className="text-left text-[10px] uppercase tracking-widest text-stone-500 border-b border-[#E7E5E4]">
                   <th className="px-3 py-3 font-medium">{t("sc.colCompany")}</th>
+                  <th className="px-3 py-3 font-medium">{t("sc.colGrain")}</th>
                   <th className="px-3 py-3 font-medium text-right">{t("sc.colTrucks")}</th>
                   <th className="px-3 py-3 font-medium text-right">{t("sales.colQty")}</th>
                   <th className="px-3 py-3 font-medium text-right">{t("sc.colSold")}</th>
@@ -328,6 +329,7 @@ export default function SalesByCompany() {
                         {c.buyer_name}
                       </button>
                     </td>
+                    <td className="px-3 py-3">{(c.product_names || []).join(", ") || "—"}</td>
                     <td className="px-3 py-3 font-mono text-right">{c.trucks}</td>
                     <td className="px-3 py-3 font-mono text-right">{c.total_quantity.toLocaleString("en-IN")}</td>
                     <td className="px-3 py-3 font-mono text-right">{formatCurrency(c.total_amount)}</td>
@@ -358,6 +360,11 @@ export default function SalesByCompany() {
           {t("sc.back")}
         </button>
         <h1 className="mt-4 text-3xl font-serif text-[#1C1917]" data-testid="sc-company-name">{company}</h1>
+        {statement?.product_names?.length > 0 && (
+          <p className="mt-1 text-sm text-stone-500" data-testid="sc-company-grain">
+            {t("sc.colGrain")}: <span className="font-medium text-[#1C1917]">{statement.product_names.join(", ")}</span>
+          </p>
+        )}
       </header>
 
       {/* filters + actions */}
