@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, Pencil, Trash2, X as XIcon } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, Pencil, Trash2, Building2, X as XIcon } from "lucide-react";
 import { Link } from "react-router-dom";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Calendar } from "@/components/ui/calendar";
@@ -270,16 +270,31 @@ export default function Dashboard() {
 
   useEffect(() => { fetchPayments(); }, [activeDateStr]);
 
+  // Payments received from sales companies (+ total still due from them)
+  const [companyPays, setCompanyPays] = useState([]);
+  const [companyDue, setCompanyDue] = useState({ due_total: 0, companies_with_due: 0 });
+  const fetchCompanyData = () => {
+    api.get(`/sales/payments/by-date?date_str=${activeDateStr}`)
+      .then((r) => setCompanyPays(r.data || []))
+      .catch(() => setCompanyPays([]));
+    api.get("/sales/dashboard-summary")
+      .then((r) => setCompanyDue(r.data))
+      .catch(() => {});
+  };
+  useEffect(() => { fetchCompanyData(); }, [activeDateStr]);
+
   // Load Dashboard-level stats + recent activity (procurement AND payments of today)
   const loadTodayStats = async () => {
     const todayIso = toIsoDate(new Date());
     try {
-      const [procRes, payRes] = await Promise.all([
+      const [procRes, payRes, coRes] = await Promise.all([
         api.get(`/procurement/entries?entry_date=${todayIso}`),
         api.get(`/payments/by-date?date_str=${todayIso}`),
+        api.get(`/sales/payments/by-date?date_str=${todayIso}`).catch(() => ({ data: [] })),
       ]);
       const rows = procRes.data || [];
       const pays = payRes.data || [];
+      const coPays = coRes.data || [];
       setTodayProcurement({
         count: rows.length,
         weight: rows.reduce((s, r) => s + Number(r.weight || 0), 0),
@@ -292,13 +307,16 @@ export default function Dashboard() {
         ...pays.map((p) => ({ kind: p.direction, when: p.created_at,
           title: `${p.direction === "in" ? t("col.received") : t("col.given")} · ${formatClientName(p.client_name)}`,
           amount: p.amount })),
+        ...coPays.map((p) => ({ kind: "company", when: p.created_at,
+          title: `${t("dashboard.companyPaid")} · ${p.buyer_name}${p.product_names?.length ? ` · ${p.product_names.join(", ")}` : ""}`,
+          amount: p.amount })),
       ];
       setRecentActivity(activity.sort((a, b) => b.when.localeCompare(a.when)).slice(0, 5));
     } catch (e) { /* silent */ }
   };
   useEffect(() => { loadTodayStats(); }, []);
 
-  const refreshAll = () => { fetchPayments(); loadTodayStats(); };
+  const refreshAll = () => { fetchPayments(); loadTodayStats(); fetchCompanyData(); };
 
   const startEdit = (p) => { setEditingPayment(p); setShowAdd(true); };
 
@@ -369,7 +387,7 @@ export default function Dashboard() {
       </header>
 
       {/* Summary stat cards (Edit 1) */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4" data-testid="dashboard-stats">
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4" data-testid="dashboard-stats">
         <StatCard label={t("dashboard.stat.procuredToday")}
           value={formatCurrency(todayProcurement.cost)}
           subvalue={`${todayProcurement.weight.toLocaleString("en-IN")} qtl · ${todayProcurement.count} ${t("proc.entries")}`}
@@ -382,6 +400,14 @@ export default function Dashboard() {
           value={formatCurrency(received.reduce((s, p) => s + p.amount, 0))}
           subvalue={`${received.length} ${t("dashboard.entries")}`}
           tone="positive" testid="dash-stat-received" />
+        <StatCard label={t("dashboard.stat.companyReceived")}
+          value={formatCurrency(companyPays.reduce((s, p) => s + p.amount, 0))}
+          subvalue={`${companyPays.length} ${t("dashboard.entries")}`}
+          tone="positive" testid="dash-stat-company-received" />
+        <StatCard label={t("dashboard.stat.companyDue")}
+          value={formatCurrency(companyDue.due_total)}
+          subvalue={`${companyDue.companies_with_due} ${t("dashboard.companies")}`}
+          tone="negative" testid="dash-stat-company-due" />
       </div>
 
       {/* Recent activity */}
@@ -394,7 +420,7 @@ export default function Dashboard() {
             {recentActivity.map((a, i) => (
               <li key={i} className="px-5 py-3 flex items-center justify-between text-sm">
                 <div className="flex items-center gap-3">
-                  {a.kind === "in" ? <ArrowDownLeft strokeWidth={1.5} className="w-4 h-4 text-emerald-700" />
+                  {a.kind === "in" || a.kind === "company" ? <ArrowDownLeft strokeWidth={1.5} className="w-4 h-4 text-emerald-700" />
                     : a.kind === "out" ? <ArrowUpRight strokeWidth={1.5} className="w-4 h-4 text-orange-700" />
                     : <Wheat strokeWidth={1.5} className="w-4 h-4 text-stone-400" />}
                   <span className="text-[#1C1917]">{a.title}</span>
@@ -465,6 +491,35 @@ export default function Dashboard() {
                 {[1,2,3].map(i => <div key={i} className="skeleton-row" />)}
               </div>
             ) : <PaymentColumn items={given} emptyMsg={t("col.noGiven")} tone="out" testid="col-given" onEdit={startEdit} onDelete={deletePayment} />}
+          </section>
+
+          <section className="md:col-span-2 bg-white border border-[#E7E5E4] p-5" data-testid="col-company-payments">
+            <div className="flex items-center justify-between mb-4 pb-3 border-b border-[#E7E5E4]">
+              <div className="flex items-center gap-2 text-emerald-800">
+                <Building2 strokeWidth={1.5} className="w-4 h-4" />
+                <span className="text-sm font-bold uppercase tracking-widest">{t("dashboard.companyPayments")}</span>
+              </div>
+              <span className="font-mono text-sm text-emerald-800" data-testid="col-company-total">
+                {formatCurrency(companyPays.reduce((s, p) => s + p.amount, 0))}
+              </span>
+            </div>
+            {companyPays.length === 0 ? (
+              <p className="text-sm text-stone-500 py-2">{t("dashboard.noCompanyPayments")}</p>
+            ) : (
+              <ul className="divide-y divide-[#E7E5E4]">
+                {companyPays.map((p) => (
+                  <li key={p.id} className="py-3 flex items-center justify-between gap-3 text-sm" data-testid={`company-pay-${p.id}`}>
+                    <div>
+                      <Link to={`/sales/companies?company=${encodeURIComponent(p.buyer_name)}`}
+                        className="font-medium text-[#1C1917] hover:underline">{p.buyer_name}</Link>
+                      {p.product_names?.length > 0 && <span className="text-stone-500"> · {p.product_names.join(", ")}</span>}
+                      <div className="text-xs text-stone-500">{(p.mode || "").toUpperCase()}{p.note ? ` · ${p.note}` : ""}</div>
+                    </div>
+                    <span className="font-mono text-emerald-800">{formatCurrency(p.amount)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
         </div>
 
