@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { ArrowDownLeft, ArrowUpRight, Plus, Calculator, Check, ChevronsUpDown, Wheat, IndianRupee, Wallet, Shield, Pencil, Trash2, Building2, X as XIcon } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import api, { formatCurrency, formatDate, formatApiError, formatClientName } from "@/lib/api";
 import { Calendar } from "@/components/ui/calendar";
 import { toast } from "sonner";
@@ -20,7 +20,7 @@ function toIsoDate(d) {
   return `${y}-${m}-${dd}`;
 }
 
-function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate, editing = null }) {
+function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate, defaultClientId = "", editing = null }) {
   const { t, lang } = useLang();
   const serif = lang === "hi" ? "" : "font-serif";
   const [clients, setClients] = useState([]);
@@ -42,12 +42,13 @@ function AddPaymentModal({ open, onOpenChange, onSaved, defaultDate, editing = n
         setEntryDate(editing.entry_date);
       } else {
         setEntryDate(defaultDate);
+        setSelectedId(defaultClientId || "");
       }
       api.get("/clients").then((r) => setClients(r.data)).catch(() => {});
     } else {
       setSelectedId(""); setAmount(""); setDescription(""); setDirection("out");
     }
-  }, [open, defaultDate, editing]);
+  }, [open, defaultDate, defaultClientId, editing]);
 
   const selectedClient = clients.find((c) => c.id === selectedId)
     || (editing && selectedId === editing.client_id ? { name: editing.client_name } : undefined);
@@ -221,6 +222,17 @@ export default function Dashboard() {
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
+  const [presetClientId, setPresetClientId] = useState("");
+
+  // "New entry" on a client page lands here as /?add=1&client=<id>: open Add Payment for that client
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    if (searchParams.get("add") === "1") {
+      setPresetClientId(searchParams.get("client") || "");
+      setShowAdd(true);
+      setSearchParams({}, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
   const [showCalcConfirm, setShowCalcConfirm] = useState(false);
   const [showCalcResult, setShowCalcResult] = useState(false);
   const [calcTotals, setCalcTotals] = useState(null);
@@ -533,7 +545,7 @@ export default function Dashboard() {
         </aside>
       </div>
 
-      <AddPaymentModal open={showAdd} onOpenChange={(v) => { setShowAdd(v); if (!v) setEditingPayment(null); }} onSaved={refreshAll} defaultDate={activeDateStr} editing={editingPayment} />
+      <AddPaymentModal open={showAdd} onOpenChange={(v) => { setShowAdd(v); if (!v) { setEditingPayment(null); setPresetClientId(""); } }} onSaved={refreshAll} defaultDate={activeDateStr} defaultClientId={presetClientId} editing={editingPayment} />
 
       {/* Calculate confirmation */}
       <Dialog open={showCalcConfirm} onOpenChange={setShowCalcConfirm}>
