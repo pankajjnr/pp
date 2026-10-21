@@ -113,7 +113,7 @@ export default function ClientDetail() {
             className="flex items-center gap-2 border border-[#D6D3D1] text-[#292524] px-3 py-2 text-xs uppercase tracking-widest hover:bg-[#F0EFEA]">
             <FileText strokeWidth={1.5} className="w-4 h-4" /> PDF
           </button>
-          <Link to="/payments/new" data-testid="add-entry-cta" className="bg-[#292524] text-[#FAFAF9] px-4 py-2 text-xs uppercase tracking-widest hover:bg-[#1C1917]">
+          <Link to={`/?add=1&client=${id}`} data-testid="add-entry-cta" className="bg-[#292524] text-[#FAFAF9] px-4 py-2 text-xs uppercase tracking-widest hover:bg-[#1C1917]">
             {t("client.newEntry")}
           </Link>
           {isAdmin && (
