@@ -152,7 +152,7 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 api_router = APIRouter(prefix="/api")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])  # HEAD too: UptimeRobot pings with HEAD
 async def root_health_check():
     """Plain, unauthenticated health check at the domain root.
     Uptime monitors (UptimeRobot, cron-job.org, etc.) ping '/' by default —
@@ -898,6 +898,13 @@ async def create_product(payload: ProductCreate, _user: dict = Depends(get_curre
 async def delete_product(product_id: str, user: dict = Depends(get_current_user)):
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Only admin can delete products")
+    in_proc = await db.procurement_entries.count_documents({"product_id": product_id})
+    in_sales = await db.sales_entries.count_documents({"product_id": product_id})
+    if in_proc or in_sales:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This product is used in {in_proc} procurement and {in_sales} sales entries and cannot be deleted.",
+        )
     res = await db.master_products.delete_one({"id": product_id})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -2470,7 +2477,7 @@ async def _company_money_state(norm: str) -> dict:
 
 
 @api_router.post("/sales/settlements", response_model=SettleOut)
-async def create_settlement(payload: SettleCreate, user: dict = Depends(get_current_user)):
+async def create_truck_settlement(payload: SettleCreate, user: dict = Depends(get_current_user)):
     sale = await db.sales_entries.find_one({"id": payload.sale_id}, {"_id": 0})
     if not sale:
         raise HTTPException(status_code=404, detail="Truck entry not found")
@@ -2510,7 +2517,7 @@ async def create_settlement(payload: SettleCreate, user: dict = Depends(get_curr
 
 
 @api_router.delete("/sales/settlements/by-sale/{sale_id}")
-async def undo_settlement(sale_id: str, _user: dict = Depends(get_current_user)):
+async def undo_truck_settlement(sale_id: str, _user: dict = Depends(get_current_user)):
     """Undo: puts the truck back to unsettled (money returns to 'not yet assigned')."""
     res = await db.sale_settlements.delete_many({"sale_id": sale_id})
     if res.deleted_count == 0:
@@ -3200,7 +3207,7 @@ async def backup_restore(file: UploadFile = File(...), user: dict = Depends(get_
 
 
 # ----- Health / Root -----
-@api_router.get("/")
+@api_router.api_route("/", methods=["GET", "HEAD"])  # HEAD too: uptime monitors ping with HEAD
 async def root():
     return {"status": "ok", "service": "ledger-book"}
 
