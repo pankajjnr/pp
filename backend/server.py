@@ -3033,6 +3033,7 @@ BACKUP_COLLECTIONS = [
     "bill_counters",
     "sale_payments",
     "sale_settlements",
+    "stock_adjustments",
     "users",
 ]
 
@@ -3206,6 +3207,174 @@ async def backup_restore(file: UploadFile = File(...), user: dict = Depends(get_
     }
 
 
+# ----- Stock balance per grain ---------------------------------------------
+# Stock (quintals) = bought (procurement weight) - sold (sales quantity)
+#                    + adjustments (opening stock, wastage, corrections; +/-).
+STOCK_ROW_LIMIT = 3000
+
+
+class StockAdjustCreate(BaseModel):
+    product_id: str
+    quantity: float  # + adds stock, - removes stock (quintals)
+    date: str  # YYYY-MM-DD
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+async def _sum_by_product(coll: str, field: str, date_field: str, upto: Optional[str] = None,
+                          before: Optional[str] = None, product_id: Optional[str] = None) -> dict:
+    """{product_id: (total, product_name)} summed inside the database."""
+    match: dict = {}
+    rng: dict = {}
+    if upto:
+        rng["$lte"] = upto
+    if before:
+        rng["$lt"] = before
+    if rng:
+        match[date_field] = rng
+    if product_id:
+        match["product_id"] = product_id
+    pipe: list = [{"$match": match}] if match else []
+    pipe.append({"$group": {"_id": "$product_id", "total": {"$sum": f"${field}"},
+                            "name": {"$first": "$product_name"}}})
+    rows = await db[coll].aggregate(pipe).to_list(None)
+    return {r["_id"]: (float(r["total"] or 0), r.get("name")) for r in rows}
+
+
+async def _stock_totals(upto: Optional[str] = None, before: Optional[str] = None,
+                        product_id: Optional[str] = None) -> dict:
+    bought = await _sum_by_product("procurement_entries", "weight", "entry_date", upto, before, product_id)
+    sold = await _sum_by_product("sales_entries", "quantity", "dispatch_date", upto, before, product_id)
+    adj = await _sum_by_product("stock_adjustments", "quantity", "date", upto, before, product_id)
+    out: dict = {}
+    for pid in set(bought) | set(sold) | set(adj):
+        b, s_, a = bought.get(pid), sold.get(pid), adj.get(pid)
+        out[pid] = {
+            "bought": round(b[0], 2) if b else 0.0,
+            "sold": round(s_[0], 2) if s_ else 0.0,
+            "adjusted": round(a[0], 2) if a else 0.0,
+            "name": next((x[1] for x in (b, s_, a) if x and x[1]), None),
+        }
+        out[pid]["balance"] = round(out[pid]["bought"] - out[pid]["sold"] + out[pid]["adjusted"], 2)
+    return out
+
+
+@api_router.get("/stock/summary")
+async def stock_summary(as_on: Optional[str] = None, _user: dict = Depends(get_current_user)):
+    as_on = as_on or today_local_date().isoformat()
+    _check_ymd(as_on, "as_on")
+    totals = await _stock_totals(upto=as_on)
+    names = {p["id"]: p["name"] for p in await db.master_products.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(None)}
+    rows = [
+        {"product_id": pid, "product_name": names.get(pid) or v["name"] or "?",
+         "bought": v["bought"], "sold": v["sold"], "adjusted": v["adjusted"], "balance": v["balance"]}
+        for pid, v in totals.items()
+    ]
+    rows.sort(key=lambda r: r["product_name"].lower())
+    return {
+        "as_on": as_on,
+        "rows": rows,
+        "totals": {
+            "bought": round(sum(r["bought"] for r in rows), 2),
+            "sold": round(sum(r["sold"] for r in rows), 2),
+            "adjusted": round(sum(r["adjusted"] for r in rows), 2),
+            "balance": round(sum(r["balance"] for r in rows), 2),
+        },
+    }
+
+
+@api_router.get("/stock/movements")
+async def stock_movements(product_id: str, as_on: Optional[str] = None, from_date: Optional[str] = None,
+                          _user: dict = Depends(get_current_user)):
+    """Every purchase, truck sold and adjustment of one grain, with a running balance."""
+    as_on = as_on or today_local_date().isoformat()
+    _check_ymd(as_on, "as_on")
+    if from_date:
+        _check_ymd(from_date, "from_date")
+    else:
+        from_date = (datetime.strptime(as_on, "%Y-%m-%d").date() - timedelta(days=6)).isoformat()
+    if from_date > as_on:
+        raise HTTPException(status_code=400, detail="From date cannot be after the 'as on' date")
+
+    product = await db.master_products.find_one({"id": product_id}, {"_id": 0})
+    before = (await _stock_totals(before=from_date, product_id=product_id)).get(product_id)
+    upto = (await _stock_totals(upto=as_on, product_id=product_id)).get(product_id)
+    opening = before["balance"] if before else 0.0
+    closing = upto["balance"] if upto else 0.0
+
+    lim = STOCK_ROW_LIMIT + 1
+    proc = await db.procurement_entries.find(
+        {"product_id": product_id, "entry_date": {"$gte": from_date, "$lte": as_on}}, {"_id": 0}
+    ).to_list(lim)
+    sales = await db.sales_entries.find(
+        {"product_id": product_id, "dispatch_date": {"$gte": from_date, "$lte": as_on}}, {"_id": 0}
+    ).to_list(lim)
+    adjs = await db.stock_adjustments.find(
+        {"product_id": product_id, "date": {"$gte": from_date, "$lte": as_on}}, {"_id": 0}
+    ).to_list(lim)
+
+    events = (
+        [(e["entry_date"], e.get("created_at", ""), {
+            "id": e["id"], "type": "bought", "date": e["entry_date"], "qty": float(e["weight"]),
+            "label": e.get("client_name") or "", "extra": None}) for e in proc]
+        + [(e["dispatch_date"], e.get("created_at", ""), {
+            "id": e["id"], "type": "sold", "date": e["dispatch_date"], "qty": -float(e["quantity"]),
+            "label": e.get("buyer_name") or "", "extra": e.get("truck_number")}) for e in sales]
+        + [(e["date"], e.get("created_at", ""), {
+            "id": e["id"], "type": "adjust", "date": e["date"], "qty": float(e["quantity"]),
+            "label": e.get("note") or "", "extra": None}) for e in adjs]
+    )
+    events.sort(key=lambda x: (x[0], x[1]))
+    truncated = len(events) > STOCK_ROW_LIMIT
+    events = events[:STOCK_ROW_LIMIT]
+    running = opening
+    rows = []
+    for _d, _c, row in events:
+        running += row["qty"]
+        row["qty"] = round(row["qty"], 2)
+        row["running"] = round(running, 2)
+        rows.append(row)
+    return {
+        "product_id": product_id,
+        "product_name": (product or {}).get("name") or (upto or before or {}).get("name") or "?",
+        "from_date": from_date, "as_on": as_on,
+        "opening": round(opening, 2), "closing": round(closing, 2),
+        "rows": rows, "truncated": truncated,
+    }
+
+
+@api_router.post("/stock/adjustments")
+async def create_stock_adjustment(payload: StockAdjustCreate, user: dict = Depends(get_current_user)):
+    product = await db.master_products.find_one({"id": payload.product_id}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Grain not found")
+    _check_ymd(payload.date, "date")
+    if datetime.strptime(payload.date, "%Y-%m-%d").date() > today_local_date():
+        raise HTTPException(status_code=400, detail="Date cannot be in the future")
+    q = float(payload.quantity)
+    if q != q or abs(q) > 10_000_000 or round(q, 2) == 0:
+        raise HTTPException(status_code=400, detail="Enter a quantity greater than 0")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "product_id": product["id"],
+        "product_name": product["name"],
+        "quantity": round(q, 2),
+        "date": payload.date,
+        "note": _clean_text(payload.note),
+        "entered_by": user.get("name", "Accountant"),
+        "created_at": now_iso(),
+    }
+    await db.stock_adjustments.insert_one(dict(doc))
+    return doc
+
+
+@api_router.delete("/stock/adjustments/{adjustment_id}")
+async def delete_stock_adjustment(adjustment_id: str, _user: dict = Depends(get_current_user)):
+    res = await db.stock_adjustments.delete_one({"id": adjustment_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Adjustment not found")
+    return {"ok": True}
+
+
 # ----- Health / Root -----
 @api_router.api_route("/", methods=["GET", "HEAD"])  # HEAD too: uptime monitors ping with HEAD
 async def root():
@@ -3263,6 +3432,9 @@ async def on_startup():
     await db.bill_counters.create_index("id", unique=True)
     await db.sale_payments.create_index([("buyer_name", 1), ("payment_date", -1)])
     await db.sale_settlements.create_index([("sale_id", 1)])
+    await db.stock_adjustments.create_index([("product_id", 1), ("date", 1)])
+    await db.procurement_entries.create_index([("product_id", 1), ("entry_date", 1)])
+    await db.sales_entries.create_index([("product_id", 1), ("dispatch_date", 1)])
     # One-time cleanup: drop legacy watermark-style settlement records and
     # clear any lingering is_settled flags that referenced them, so we start
     # the new date-range settlement model from a clean slate.
