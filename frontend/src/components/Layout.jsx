@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck, Building2 } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck, Building2, Boxes } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 import {
@@ -59,6 +59,7 @@ export default function Layout() {
     { to: "/clients", label: t("nav.clients"), icon: Users, testid: "nav-clients" },
     { to: "/procurement/client-subledger", label: t("nav.clientSubledger"), icon: ScrollText, testid: "nav-client-subledger" },
     { to: "/sales/companies", label: t("nav.salesCompanies"), icon: Building2, testid: "nav-sales-companies" },
+    { to: "/stock", label: t("nav.stock"), icon: Boxes, testid: "nav-stock" },
   ];
   const isMoreActive = moreItems.some((n) => location.pathname === n.to || location.pathname.startsWith(n.to + "/"));
 
