@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
-import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck, Building2, Boxes } from "lucide-react";
+import { BookOpen, Users, LogOut, Languages, ClipboardList, ScrollText, Wheat, Wallet, Shield, MoreHorizontal, Clock, Truck, Building2, Boxes, TrendingUp } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/context/LangContext";
 import {
@@ -51,6 +51,7 @@ export default function Layout() {
     { to: "/sales", label: t("nav.sales"), icon: Truck, testid: "nav-sales" },
   ];
   if (user?.role === "admin") {
+    navItems.push({ to: "/owner/profit", label: "Owner Profit", icon: TrendingUp, testid: "nav-owner-profit" });
     navItems.push({ to: "/admin/backup", label: "Backup", icon: Shield, testid: "nav-backup" });
   }
 
