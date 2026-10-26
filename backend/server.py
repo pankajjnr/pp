@@ -3258,6 +3258,113 @@ async def _stock_totals(upto: Optional[str] = None, before: Optional[str] = None
     return out
 
 
+@api_router.get("/owner/profit-summary")
+async def owner_profit_summary(user: dict = Depends(get_current_user)):
+    """Owner-only all-time crop-wise profit estimate using weighted-average purchase cost.
+
+    Expenses are intentionally excluded until the future expense module is implemented.
+    Firm-wise profit is not available because the current procurement/sales schemas do not
+    store a firm on each transaction.
+    """
+    _require_admin(user)
+
+    products = await db.master_products.find({}, {"_id": 0, "id": 1, "name": 1}).to_list(None)
+    procurement = await db.procurement_entries.find(
+        {}, {"_id": 0, "product_id": 1, "weight": 1, "rate": 1, "total_amount": 1}
+    ).to_list(None)
+    sales = await db.sales_entries.find(
+        {}, {"_id": 0, "product_id": 1, "quantity": 1, "rate": 1, "total_amount": 1}
+    ).to_list(None)
+    adjustments = await db.stock_adjustments.find(
+        {}, {"_id": 0, "product_id": 1, "quantity": 1}
+    ).to_list(None)
+
+    rows_by_id = {
+        p["id"]: {
+            "product_id": p["id"], "product_name": p["name"],
+            "purchased_quantity": 0.0, "purchase_value": 0.0,
+            "sold_quantity": 0.0, "sales_revenue": 0.0,
+            "stock_adjustment_quantity": 0.0,
+        }
+        for p in products
+    }
+
+    def row_for(product_id: str) -> dict:
+        if product_id not in rows_by_id:
+            rows_by_id[product_id] = {
+                "product_id": product_id, "product_name": "Unknown product",
+                "purchased_quantity": 0.0, "purchase_value": 0.0,
+                "sold_quantity": 0.0, "sales_revenue": 0.0,
+                "stock_adjustment_quantity": 0.0,
+            }
+        return rows_by_id[product_id]
+
+    for entry in procurement:
+        row = row_for(entry.get("product_id", ""))
+        qty = float(entry.get("weight") or 0)
+        amount = float(entry.get("total_amount") or (qty * float(entry.get("rate") or 0)))
+        row["purchased_quantity"] += qty
+        row["purchase_value"] += amount
+
+    for sale in sales:
+        row = row_for(sale.get("product_id", ""))
+        qty = float(sale.get("quantity") or 0)
+        amount = float(sale.get("total_amount") or (qty * float(sale.get("rate") or 0)))
+        row["sold_quantity"] += qty
+        row["sales_revenue"] += amount
+
+    for adjustment in adjustments:
+        row = row_for(adjustment.get("product_id", ""))
+        row["stock_adjustment_quantity"] += float(adjustment.get("quantity") or 0)
+
+    rows = []
+    for row in rows_by_id.values():
+        bought_qty = row["purchased_quantity"]
+        purchase_value = row["purchase_value"]
+        sold_qty = row["sold_quantity"]
+        revenue = row["sales_revenue"]
+        average_cost = purchase_value / bought_qty if bought_qty > 0 else 0.0
+        cost_of_goods_sold = sold_qty * average_cost
+        remaining = bought_qty - sold_qty + row["stock_adjustment_quantity"]
+        row.update({
+            "purchased_quantity": round(bought_qty, 2),
+            "purchase_value": round(purchase_value, 2),
+            "sold_quantity": round(sold_qty, 2),
+            "sales_revenue": round(revenue, 2),
+            "average_purchase_rate": round(average_cost, 2),
+            "cost_of_goods_sold": round(cost_of_goods_sold, 2),
+            "gross_profit": round(revenue - cost_of_goods_sold, 2),
+            "remaining_stock": round(remaining, 2),
+            "stock_adjustment_quantity": round(row["stock_adjustment_quantity"], 2),
+        })
+        rows.append(row)
+
+    rows.sort(key=lambda r: r["product_name"].lower())
+    totals = {
+        "purchased_quantity": round(sum(r["purchased_quantity"] for r in rows), 2),
+        "purchase_value": round(sum(r["purchase_value"] for r in rows), 2),
+        "sold_quantity": round(sum(r["sold_quantity"] for r in rows), 2),
+        "sales_revenue": round(sum(r["sales_revenue"] for r in rows), 2),
+        "cost_of_goods_sold": round(sum(r["cost_of_goods_sold"] for r in rows), 2),
+        "gross_profit": round(sum(r["gross_profit"] for r in rows), 2),
+        "remaining_stock": round(sum(r["remaining_stock"] for r in rows), 2),
+        "expenses": 0.0,
+        "net_profit": round(sum(r["gross_profit"] for r in rows), 2),
+    }
+    return {
+        "rows": rows,
+        "totals": totals,
+        "expenses_module": "reserved_for_future",
+        "calculation_method": "weighted_average_purchase_cost",
+        "notes": [
+            "Profit is an estimate based on weighted-average recorded procurement cost.",
+            "Expenses are not deducted yet; the Expenses section is reserved for later.",
+            "Firm-wise profit is unavailable until transactions record the firm name.",
+            "Stock adjustments affect remaining quantity but do not have a cost value.",
+        ],
+    }
+
+
 @api_router.get("/stock/summary")
 async def stock_summary(as_on: Optional[str] = None, _user: dict = Depends(get_current_user)):
     as_on = as_on or today_local_date().isoformat()
