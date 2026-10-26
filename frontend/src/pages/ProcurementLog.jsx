@@ -77,6 +77,8 @@ export default function ProcurementLog() {
 
   // final "review whole batch" dialog & its save-all action
   const [batchReviewOpen, setBatchReviewOpen] = useState(false);
+  const [batchEditEntry, setBatchEditEntry] = useState(null);
+  const [batchEditForm, setBatchEditForm] = useState(null);
   const [savingBatch, setSavingBatch] = useState(false);
 
   // product management dialog
@@ -196,14 +198,43 @@ export default function ProcurementLog() {
     setPendingEntries((prev) => prev.filter((it) => it.localId !== localId));
   };
 
+  // Edit a pending batch item inside its own popup, matching Sales Entry.
   const editFromBatch = (entry) => {
-    setEntryDate(entry.entry_date);
-    setClientId(entry.client_id);
-    setProductId(entry.product_id);
-    setWeight(String(entry.weight));
-    setRate(String(entry.rate));
-    setEditingLocalId(entry.localId);
+    setBatchEditEntry(entry);
+    setBatchEditForm({
+      entry_date: entry.entry_date,
+      client_id: entry.client_id,
+      product_id: entry.product_id,
+      weight: String(entry.weight),
+      rate: String(entry.rate),
+    });
     setBatchReviewOpen(false);
+  };
+
+  const saveBatchEdit = () => {
+    if (!batchEditForm?.client_id) return toast.error("Select a client");
+    if (!batchEditForm?.product_id) return toast.error("Select a product");
+    if (!(Number(batchEditForm.weight) > 0)) return toast.error("Weight must be > 0");
+    if (!(Number(batchEditForm.rate) > 0)) return toast.error("Rate must be > 0");
+    if (batchEditForm.entry_date !== todayIso && batchEditForm.entry_date !== yesterdayIso) {
+      return toast.error("Entry date must be today or yesterday");
+    }
+    const client = clients.find((c) => c.id === batchEditForm.client_id);
+    const product = products.find((p) => p.id === batchEditForm.product_id);
+    const updated = {
+      ...batchEditEntry,
+      ...batchEditForm,
+      client_name: client?.name || batchEditEntry.client_name,
+      product_name: product?.name || batchEditEntry.product_name,
+      weight: Number(batchEditForm.weight),
+      rate: Number(batchEditForm.rate),
+      total_amount: +(Number(batchEditForm.weight) * Number(batchEditForm.rate)).toFixed(2),
+    };
+    setPendingEntries((prev) => prev.map((item) => item.localId === updated.localId ? updated : item));
+    setBatchEditEntry(null);
+    setBatchEditForm(null);
+    setBatchReviewOpen(true);
+    toast.success("Entry updated in the pending batch");
   };
 
   // The server only accepts today / yesterday, and saves the batch all-or-nothing.
@@ -627,6 +658,68 @@ export default function ProcurementLog() {
               <Check strokeWidth={1.5} className="w-4 h-4" />
               {editingLocalId ? "Update in Batch" : "Add to Batch"}
             </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Batch item editor — keep editing inside a popup instead of the main page form */}
+      <Dialog open={!!batchEditEntry} onOpenChange={(open) => {
+        if (!open) { setBatchEditEntry(null); setBatchEditForm(null); setBatchReviewOpen(true); }
+      }}>
+        <DialogContent className="bg-[#F9F8F6] border border-[#E7E5E4] rounded-sm max-w-md" data-testid="batch-entry-edit-dialog">
+          <DialogHeader>
+            <DialogTitle className="text-2xl font-serif text-[#1C1917]">Edit pending entry</DialogTitle>
+            <DialogDescription className="text-sm text-stone-500">
+              Update this entry here. Changes apply to the pending batch and are not saved to the server until you confirm the batch.
+            </DialogDescription>
+          </DialogHeader>
+          {batchEditForm && (
+            <div className="space-y-4">
+              <div>
+                <label className="text-[11px] uppercase tracking-widest text-stone-500">Date</label>
+                <input type="date" min={yesterdayIso} max={todayIso} value={batchEditForm.entry_date}
+                  onChange={(e) => setBatchEditForm({ ...batchEditForm, entry_date: e.target.value })}
+                  className="mt-1 w-full bg-transparent border-b border-[#D6D3D1] py-2 font-mono text-sm focus:outline-none focus:border-[#292524]" />
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-widest text-stone-500">Client</label>
+                <select value={batchEditForm.client_id} onChange={(e) => setBatchEditForm({ ...batchEditForm, client_id: e.target.value })}
+                  className="mt-1 w-full bg-white border-b border-[#D6D3D1] py-2 text-sm">
+                  {clients.map((c) => <option key={c.id} value={c.id}>{formatClientName(c.name)}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="text-[11px] uppercase tracking-widest text-stone-500">Product</label>
+                <select value={batchEditForm.product_id} onChange={(e) => setBatchEditForm({ ...batchEditForm, product_id: e.target.value })}
+                  className="mt-1 w-full bg-white border-b border-[#D6D3D1] py-2 text-sm">
+                  {products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-[11px] uppercase tracking-widest text-stone-500">Weight (Quintal)</label>
+                  <input type="number" min="0.01" step="0.01" value={batchEditForm.weight}
+                    onChange={(e) => setBatchEditForm({ ...batchEditForm, weight: e.target.value })}
+                    className="mt-1 w-full bg-transparent border-b border-[#D6D3D1] py-2 font-mono text-sm" />
+                </div>
+                <div>
+                  <label className="text-[11px] uppercase tracking-widest text-stone-500">Rate (₹/Quintal)</label>
+                  <input type="number" min="0.01" step="0.01" value={batchEditForm.rate}
+                    onChange={(e) => setBatchEditForm({ ...batchEditForm, rate: e.target.value })}
+                    className="mt-1 w-full bg-transparent border-b border-[#D6D3D1] py-2 font-mono text-sm" />
+                </div>
+              </div>
+              <div className="border-t border-dashed border-[#E7E5E4] pt-3">
+                <div className="text-[11px] uppercase tracking-widest text-stone-500">Total amount</div>
+                <div className="font-mono text-2xl text-[#1C1917]">{formatCurrency(Number(batchEditForm.weight || 0) * Number(batchEditForm.rate || 0))}</div>
+              </div>
+            </div>
+          )}
+          <DialogFooter className="gap-2 pt-4">
+            <button type="button" onClick={() => { setBatchEditEntry(null); setBatchEditForm(null); setBatchReviewOpen(true); }}
+              className="border border-[#D6D3D1] text-[#292524] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#F0EFEA]">Cancel</button>
+            <button type="button" onClick={saveBatchEdit}
+              className="bg-[#B45309] text-[#FAFAF9] px-5 py-2 text-sm uppercase tracking-widest hover:bg-[#92400E]">Save changes</button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
